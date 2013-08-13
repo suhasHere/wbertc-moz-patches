@@ -1,7 +1,7 @@
 # HG changeset patch
 # Parent 5f695ef3a09c2d8dd742d063283607cf57ea1a8b
 # User Paul Adenot <paul@paul.cx>
-Bug 785584 - Add a content API to set the requested latency
+Bug 904617 Add a content API to set the requested latency
 
 diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
 --- a/content/media/AudioStream.cpp

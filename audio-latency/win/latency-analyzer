@@ -3,12 +3,17 @@
 # Date 1359397357 -3600
 # Node ID 42d2048c3339a8943574998f515f004dd2b79852
 # Parent 1f5e05b70daa9d0827f6ee7e2de360e6402d80ee
-Bug 785584 - Log latency, and adds a python script to understand the log.
+Bug 904617 - Log latency, and adds a python script to understand the log.
 
 diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
 --- a/content/media/AudioSegment.cpp
 +++ b/content/media/AudioSegment.cpp
-@@ -7,6 +7,7 @@
+@@ -2,16 +2,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "AudioSegment.h"
  
  #include "AudioStream.h"
  #include "AudioChannelFormat.h"
@@ -16,7 +21,17 @@ diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
  
  namespace mozilla {
  
-@@ -183,6 +184,7 @@ AudioSegment::WriteTo(AudioStream* aOutp
+ template <class SrcT, class DestT>
+ static void
+ InterleaveAndConvertBuffer(const SrcT** aSourceChannels,
+                            int32_t aLength, float aVolume,
+                            int32_t aChannels,
+@@ -178,15 +179,16 @@ AudioSegment::WriteTo(AudioStream* aOutp
+                                      outputChannels,
+                                      buf.Elements());
+         }
+       } else {
+         // Assumes that a bit pattern of zeroes == 0.0f
          memset(buf.Elements(), 0, buf.Length()*sizeof(AudioDataValue));
        }
        aOutput->Write(buf.Elements(), int32_t(duration));
@@ -24,10 +39,19 @@ diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
        offset += duration;
      }
    }
+   aOutput->Start();
+ }
+ 
+ }
 diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
 --- a/content/media/AudioSegment.h
 +++ b/content/media/AudioSegment.h
-@@ -10,6 +10,7 @@
+@@ -5,16 +5,17 @@
+ 
+ #ifndef MOZILLA_AUDIOSEGMENT_H_
+ #define MOZILLA_AUDIOSEGMENT_H_
+ 
+ #include "MediaSegment.h"
  #include "nsISupportsImpl.h"
  #include "AudioSampleFormat.h"
  #include "SharedBuffer.h"
@@ -35,7 +59,17 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
  
  namespace mozilla {
  
-@@ -103,6 +104,7 @@ struct AudioChunk {
+ class AudioStream;
+ 
+ /**
+  * For auto-arrays etc, guess this as the common number of channels.
+  */
+@@ -98,16 +99,17 @@ struct AudioChunk {
+     mVolume = 1.0f;
+   }
+ 
+   TrackTicks mDuration; // in frames within the buffer
+   nsRefPtr<ThreadSharedObject> mBuffer; // the buffer object whose lifetime is managed; null means data is all zeroes
    nsTArray<const void*> mChannelData; // one pointer per channel; empty if and only if mBuffer is null
    float mVolume; // volume multiplier to apply (1.0f if mBuffer is nonnull)
    SampleFormat mBufferFormat; // format of frames in mBuffer (only meaningful if mBuffer is nonnull)
@@ -43,7 +77,17 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
  };
  
  /**
-@@ -126,6 +128,7 @@ public:
+  * A list of audio samples consisting of a sequence of slices of SharedBuffers.
+  * The audio rate is determined by the track, not stored in this class.
+  */
+ class AudioSegment : public MediaSegmentBase<AudioSegment, AudioChunk> {
+ public:
+@@ -121,38 +123,41 @@ public:
+   {
+     AudioChunk* chunk = AppendChunk(aDuration);
+     chunk->mBuffer = aBuffer;
+     for (uint32_t channel = 0; channel < aChannelData.Length(); ++channel) {
+       chunk->mChannelData.AppendElement(aChannelData[channel]);
      }
      chunk->mVolume = 1.0f;
      chunk->mBufferFormat = AUDIO_FORMAT_FLOAT32;
@@ -51,7 +95,12 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
    }
    void AppendFrames(already_AddRefed<ThreadSharedObject> aBuffer,
                      const nsTArray<const int16_t*>& aChannelData,
-@@ -138,6 +141,7 @@ public:
+                     int32_t aDuration)
+   {
+     AudioChunk* chunk = AppendChunk(aDuration);
+     chunk->mBuffer = aBuffer;
+     for (uint32_t channel = 0; channel < aChannelData.Length(); ++channel) {
+       chunk->mChannelData.AppendElement(aChannelData[channel]);
      }
      chunk->mVolume = 1.0f;
      chunk->mBufferFormat = AUDIO_FORMAT_S16;
@@ -59,7 +108,10 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
    }
    // Consumes aChunk, and returns a pointer to the persistent copy of aChunk
    // in the segment.
-@@ -148,6 +152,7 @@ public:
+   AudioChunk* AppendAndConsumeChunk(AudioChunk* aChunk)
+   {
+     AudioChunk* chunk = AppendChunk(aChunk->mDuration);
+     chunk->mBuffer = aChunk->mBuffer.forget();
      chunk->mChannelData.SwapElements(aChunk->mChannelData);
      chunk->mVolume = aChunk->mVolume;
      chunk->mBufferFormat = aChunk->mBufferFormat;
@@ -67,10 +119,20 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
      return chunk;
    }
    void ApplyVolume(float aVolume);
+   void WriteTo(AudioStream* aOutput);
+ 
+   static Type StaticType() { return AUDIO; }
+ };
+ 
 diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
 --- a/content/media/AudioStream.cpp
 +++ b/content/media/AudioStream.cpp
-@@ -14,6 +14,7 @@
+@@ -9,16 +9,17 @@
+ #include "prdtoa.h"
+ #include "AudioStream.h"
+ #include "nsAlgorithm.h"
+ #include "VideoUtils.h"
+ #include "mozilla/Monitor.h"
  #include "mozilla/Mutex.h"
  #include <algorithm>
  #include "mozilla/Preferences.h"
@@ -78,7 +140,17 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
  
  #if defined(MOZ_CUBEB)
  #include "nsAutoRef.h"
-@@ -382,6 +383,8 @@ private:
+ #include "cubeb/cubeb.h"
+ 
+ template <>
+ class nsAutoRefTraits<cubeb_stream> : public nsPointerRefTraits<cubeb_stream>
+ {
+@@ -377,16 +378,18 @@ private:
+   double mVolume;
+ 
+   // Owning reference to a cubeb_stream.  cubeb_stream_destroy is called by
+   // nsAutoRef's destructor.
+   nsAutoRef<cubeb_stream> mCubebStream;
  
    uint32_t mBytesPerFrame;
  
@@ -87,7 +159,17 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
    uint32_t BytesToFrames(uint32_t aBytes) {
      NS_ASSERTION(aBytes % mBytesPerFrame == 0,
                   "Byte count not aligned on frames size.");
-@@ -504,6 +507,7 @@ BufferedAudioStream::BufferedAudioStream
+     return aBytes / mBytesPerFrame;
+   }
+ 
+   uint32_t FramesToBytes(uint32_t aFrames) {
+     return aFrames * mBytesPerFrame;
+@@ -499,24 +502,26 @@ WriteDumpFile(FILE* aDumpFile, AudioStre
+   fflush(aDumpFile);
+ }
+ 
+ #if defined(MOZ_CUBEB)
+ BufferedAudioStream::BufferedAudioStream()
    : mMonitor("BufferedAudioStream"), mLostFrames(0), mDumpFile(nullptr),
      mVolume(1.0), mBytesPerFrame(0), mState(INITIALIZED)
  {
@@ -95,7 +177,8 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
  }
  
  BufferedAudioStream::~BufferedAudioStream()
-@@ -512,6 +516,7 @@ BufferedAudioStream::~BufferedAudioStrea
+ {
+   Shutdown();
    if (mDumpFile) {
      fclose(mDumpFile);
    }
@@ -103,7 +186,17 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
  }
  
  nsresult
-@@ -628,6 +633,7 @@ BufferedAudioStream::Write(const AudioDa
+ BufferedAudioStream::EnsureTimeStretcherInitialized()
+ {
+   MonitorAutoLock mon(mMonitor);
+   return AudioStream::EnsureTimeStretcherInitialized();
+ }
+@@ -623,16 +628,17 @@ BufferedAudioStream::Write(const AudioDa
+           return NS_ERROR_FAILURE;
+         }
+       }
+       mon.Wait();
+     }
    }
  
    mWritten += aFrames;
@@ -111,7 +204,17 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
  
    return NS_OK;
  }
-@@ -898,6 +904,15 @@ BufferedAudioStream::DataCallback(void* 
+ 
+ uint32_t
+ BufferedAudioStream::Available()
+ {
+   MonitorAutoLock mon(mMonitor);
+@@ -893,16 +899,25 @@ BufferedAudioStream::DataCallback(void* 
+              ("AudioStream %p lost %d frames", this, underrunFrames));
+     }
+ #endif
+     mLostFrames += underrunFrames;
+     servicedFrames += underrunFrames;
    }
  
    WriteDumpFile(mDumpFile, this, aFrames, aBuffer);
@@ -127,6 +230,11 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
  
    mAudioClock.UpdateWritePosition(servicedFrames);
    return servicedFrames;
+ }
+ 
+ void
+ BufferedAudioStream::StateCallback(cubeb_state aState)
+ {
 diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
 new file mode 100644
 --- /dev/null
@@ -307,7 +415,12 @@ new file mode 100644
 diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
 --- a/content/media/MediaSegment.h
 +++ b/content/media/MediaSegment.h
-@@ -7,7 +7,9 @@
+@@ -2,17 +2,19 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef MOZILLA_MEDIASEGMENT_H_
  #define MOZILLA_MEDIASEGMENT_H_
  
  #include "nsTArray.h"
@@ -317,7 +430,17 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
  
  namespace mozilla {
  
-@@ -176,6 +178,7 @@ public:
+ /**
+  * We represent media times in 64-bit fixed point. So 1 MediaTime is
+  * 1/(2^MEDIA_TIME_FRAC_BITS) seconds.
+  */
+ typedef int64_t MediaTime;
+@@ -171,16 +173,17 @@ public:
+     if (aDuration <= 0) {
+       return;
+     }
+     if (!mChunks.IsEmpty() && mChunks[0].IsNull()) {
+       mChunks[0].mDuration += aDuration;
      } else {
        mChunks.InsertElementAt(0)->SetNull(aDuration);
      }
@@ -325,7 +448,17 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
      mDuration += aDuration;
    }
    virtual void AppendNullData(TrackTicks aDuration)
-@@ -309,6 +312,7 @@ protected:
+   {
+     if (aDuration <= 0) {
+       return;
+     }
+     if (!mChunks.IsEmpty() && mChunks[mChunks.Length() - 1].IsNull()) {
+@@ -304,13 +307,14 @@ protected:
+       t -= c->GetDuration();
+       chunksToRemove = i + 1 - aStartIndex;
+     }
+     mChunks.RemoveElementsAt(aStartIndex, chunksToRemove);
+     mDuration -= aDuration - t;
    }
  
    nsTArray<Chunk> mChunks;
@@ -333,10 +466,17 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
  };
  
  }
+ 
+ #endif /* MOZILLA_MEDIASEGMENT_H_ */
 diff --git a/content/media/VideoSegment.h b/content/media/VideoSegment.h
 --- a/content/media/VideoSegment.h
 +++ b/content/media/VideoSegment.h
-@@ -72,11 +72,13 @@ struct VideoChunk {
+@@ -67,21 +67,23 @@ struct VideoChunk {
+   {
+     return aOther.mFrame == mFrame;
+   }
+   bool IsNull() const { return !mFrame.GetImage(); }
+   void SetNull(TrackTicks aDuration)
    {
      mDuration = aDuration;
      mFrame.SetNull();
@@ -350,10 +490,20 @@ diff --git a/content/media/VideoSegment.h b/content/media/VideoSegment.h
  };
  
  class VideoSegment : public MediaSegmentBase<VideoSegment, VideoChunk> {
+ public:
+   typedef mozilla::layers::Image Image;
+ 
+   VideoSegment();
+   ~VideoSegment();
 diff --git a/content/media/moz.build b/content/media/moz.build
 --- a/content/media/moz.build
 +++ b/content/media/moz.build
-@@ -63,6 +63,7 @@ EXPORTS += [
+@@ -58,16 +58,17 @@ EXPORTS += [
+     'AudioSampleFormat.h',
+     'AudioSegment.h',
+     'AudioStream.h',
+     'BufferMediaResource.h',
+     'DOMMediaStream.h',
      'DecoderTraits.h',
      'EncodedBufferCache.h',
      'FileBlockCache.h',
@@ -361,7 +511,17 @@ diff --git a/content/media/moz.build b/content/media/moz.build
      'MediaCache.h',
      'MediaDecoder.h',
      'MediaDecoderOwner.h',
-@@ -107,6 +108,7 @@ CPP_SOURCES += [
+     'MediaDecoderReader.h',
+     'MediaDecoderStateMachine.h',
+     'MediaMetadataManager.h',
+     'MediaRecorder.h',
+     'MediaResource.h',
+@@ -102,16 +103,17 @@ CPP_SOURCES += [
+     'AudioNodeStream.cpp',
+     'AudioSegment.cpp',
+     'AudioStream.cpp',
+     'AudioStreamTrack.cpp',
+     'DOMMediaStream.cpp',
      'DecoderTraits.cpp',
      'EncodedBufferCache.cpp',
      'FileBlockCache.cpp',
@@ -369,10 +529,20 @@ diff --git a/content/media/moz.build b/content/media/moz.build
      'MediaCache.cpp',
      'MediaDecoder.cpp',
      'MediaDecoderReader.cpp',
+     'MediaDecoderStateMachine.cpp',
+     'MediaRecorder.cpp',
+     'MediaResource.cpp',
+     'MediaStreamGraph.cpp',
+     'MediaStreamTrack.cpp',
 diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/MediaEngineWebRTC.h
 --- a/content/media/webrtc/MediaEngineWebRTC.h
 +++ b/content/media/webrtc/MediaEngineWebRTC.h
-@@ -357,6 +357,7 @@ public:
+@@ -352,30 +352,34 @@ public:
+     , mVoiceEngine(nullptr)
+     , mVideoEngineInit(false)
+     , mAudioEngineInit(false)
+     , mCameraManager(aCameraManager)
+     , mWindowId(aWindowId)
    {
  	mVideoSources.Init();
  	mAudioSources.Init();
@@ -380,7 +550,13 @@ diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/Med
    }
  #else
    MediaEngineWebRTC()
-@@ -370,7 +371,10 @@ public:
+     : mMutex("mozilla::MediaEngineWebRTC")
+     , mVideoEngine(nullptr)
+     , mVoiceEngine(nullptr)
+     , mVideoEngineInit(false)
+     , mAudioEngineInit(false)
+   {
+     mVideoSources.Init();
      mAudioSources.Init();
    }
  #endif
@@ -392,10 +568,17 @@ diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/Med
  
    // Clients should ensure to clean-up sources video/audio sources
    // before invoking Shutdown on this class.
+   void Shutdown();
+ 
+   virtual void EnumerateVideoDevices(nsTArray<nsRefPtr<MediaEngineVideoSource> >*);
+   virtual void EnumerateAudioDevices(nsTArray<nsRefPtr<MediaEngineAudioSource> >*);
+ 
 diff --git a/content/media/webrtc/MediaEngineWebRTCAudio.cpp b/content/media/webrtc/MediaEngineWebRTCAudio.cpp
 --- a/content/media/webrtc/MediaEngineWebRTCAudio.cpp
 +++ b/content/media/webrtc/MediaEngineWebRTCAudio.cpp
-@@ -3,6 +3,7 @@
+@@ -1,13 +1,14 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
   * You can obtain one at http://mozilla.org/MPL/2.0/. */
  
  #include "MediaEngineWebRTC.h"
@@ -403,6 +586,11 @@ diff --git a/content/media/webrtc/MediaEngineWebRTCAudio.cpp b/content/media/web
  
  #define CHANNELS 1
  #define ENCODING "L16"
+ #define DEFAULT_PORT 5555
+ 
+ #define SAMPLE_RATE 256000
+ #define SAMPLE_FREQUENCY 16000
+ #define SAMPLE_LENGTH ((SAMPLE_FREQUENCY*10)/1000)
 diff --git a/graph.py b/graph.py
 new file mode 100644
 --- /dev/null
@@ -499,7 +687,12 @@ new file mode 100644
 diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
 --- a/layout/build/nsLayoutStatics.cpp
 +++ b/layout/build/nsLayoutStatics.cpp
-@@ -92,6 +92,7 @@
+@@ -87,16 +87,17 @@
+ #include "WMFDecoder.h"
+ #endif
+ 
+ #ifdef MOZ_GSTREAMER
+ #include "GStreamerFormatHelper.h"
  #endif
  
  #include "AudioStream.h"
@@ -507,7 +700,17 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  
  #ifdef MOZ_WIDGET_GONK
  #include "nsVolumeService.h"
-@@ -249,6 +250,7 @@ nsLayoutStatics::Initialize()
+ using namespace mozilla::system;
+ #endif
+ 
+ #include "nsError.h"
+ 
+@@ -244,16 +245,17 @@ nsLayoutStatics::Initialize()
+ 
+   rv = nsFocusManager::Init();
+   if (NS_FAILED(rv)) {
+     NS_ERROR("Could not initialize nsFocusManager");
+     return rv;
    }
  
    AudioStream::InitLibrary();
@@ -515,7 +718,17 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  
    nsContentSink::InitializeStatics();
    nsHtml5Module::InitializeStatics();
-@@ -353,6 +355,7 @@ nsLayoutStatics::Shutdown()
+   nsLayoutUtils::Initialize();
+   nsIPresShell::InitializeStatics();
+   nsRefreshDriver::InitializeStatics();
+ 
+   nsCORSListenerProxy::Startup();
+@@ -348,16 +350,17 @@ nsLayoutStatics::Shutdown()
+   MediaPluginHost::Shutdown();
+ #endif
+ 
+ #ifdef MOZ_GSTREAMER
+   GStreamerFormatHelper::Shutdown();
  #endif
  
    AudioStream::ShutdownLibrary();
@@ -523,10 +736,20 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  
  #ifdef MOZ_WMF
    WMFDecoder::UnloadDLLs();
+ #endif
+ 
+ #ifdef MOZ_WIDGET_GONK
+   nsVolumeService::Shutdown();
+ #endif
 diff --git a/media/webrtc/signaling/test/moz.build b/media/webrtc/signaling/test/moz.build
 --- a/media/webrtc/signaling/test/moz.build
 +++ b/media/webrtc/signaling/test/moz.build
-@@ -8,8 +8,8 @@ MODULE = 'test_signaling'
+@@ -3,13 +3,13 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ MODULE = 'test_signaling'
  
  if CONFIG['OS_TARGET'] != 'WINNT' and CONFIG['MOZ_WIDGET_TOOLKIT'] != 'gonk':
      CPP_UNIT_TESTS += [

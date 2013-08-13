@@ -1,12 +1,17 @@
 # HG changeset patch
 # Parent 95df3ec3bb70fe564900e9fa32745084a6cd9e03
 # User Paul Adenot <paul@paul.cx>
-Bug 785584 - Add a way to get cubeb latency.
+Bug 904617 - Add a way to get cube latency
 
 diff --git a/layout/media/symbols.def.in b/layout/media/symbols.def.in
 --- a/layout/media/symbols.def.in
 +++ b/layout/media/symbols.def.in
-@@ -120,6 +120,7 @@ cubeb_stream_get_position
+@@ -115,16 +115,17 @@ speex_resampler_strerror
+ cubeb_destroy
+ cubeb_init
+ cubeb_get_max_channel_count
+ cubeb_stream_destroy
+ cubeb_stream_get_position
  cubeb_stream_init
  cubeb_stream_start
  cubeb_stream_stop
@@ -14,10 +19,20 @@ diff --git a/layout/media/symbols.def.in b/layout/media/symbols.def.in
  #endif
  #ifdef MOZ_OGG
  th_comment_clear
+ th_comment_init
+ th_decode_alloc
+ th_decode_free
+ th_decode_headerin
+ th_decode_packetin
 diff --git a/media/libcubeb/include/cubeb.h b/media/libcubeb/include/cubeb.h
 --- a/media/libcubeb/include/cubeb.h
 +++ b/media/libcubeb/include/cubeb.h
-@@ -234,6 +234,14 @@ int cubeb_stream_stop(cubeb_stream * str
+@@ -229,13 +229,21 @@ int cubeb_stream_stop(cubeb_stream * str
+ 
+ /** Get the current stream playback position.
+     @param stream
+     @param position Playback position in frames.
+     @retval CUBEB_OK
      @retval CUBEB_ERROR */
  int cubeb_stream_get_position(cubeb_stream * stream, uint64_t * position);
  
@@ -32,10 +47,17 @@ diff --git a/media/libcubeb/include/cubeb.h b/media/libcubeb/include/cubeb.h
  #if defined(__cplusplus)
  }
  #endif
+ 
+ #endif /* CUBEB_c2f983e9_c96f_e71c_72c3_bbf62992a382 */
 diff --git a/media/libcubeb/src/cubeb-internal.h b/media/libcubeb/src/cubeb-internal.h
 --- a/media/libcubeb/src/cubeb-internal.h
 +++ b/media/libcubeb/src/cubeb-internal.h
-@@ -23,6 +23,7 @@ struct cubeb_ops {
+@@ -18,11 +18,12 @@ struct cubeb_ops {
+                       cubeb_stream_params stream_params, unsigned int latency,
+                       cubeb_data_callback data_callback,
+                       cubeb_state_callback state_callback,
+                       void * user_ptr);
+   void (* stream_destroy)(cubeb_stream * stream);
    int (* stream_start)(cubeb_stream * stream);
    int (* stream_stop)(cubeb_stream * stream);
    int (* stream_get_position)(cubeb_stream * stream, uint64_t * position);
@@ -46,7 +68,12 @@ diff --git a/media/libcubeb/src/cubeb-internal.h b/media/libcubeb/src/cubeb-inte
 diff --git a/media/libcubeb/src/cubeb.c b/media/libcubeb/src/cubeb.c
 --- a/media/libcubeb/src/cubeb.c
 +++ b/media/libcubeb/src/cubeb.c
-@@ -224,3 +224,13 @@ cubeb_stream_get_position(cubeb_stream *
+@@ -219,8 +219,18 @@ int
+ cubeb_stream_get_position(cubeb_stream * stream, uint64_t * position)
+ {
+   if (!stream || !position) {
+     return CUBEB_ERROR_INVALID_PARAMETER;
+   }
  
    return stream->context->ops->stream_get_position(stream, position);
  }
@@ -63,7 +90,12 @@ diff --git a/media/libcubeb/src/cubeb.c b/media/libcubeb/src/cubeb.c
 diff --git a/media/libcubeb/src/cubeb_alsa.c b/media/libcubeb/src/cubeb_alsa.c
 --- a/media/libcubeb/src/cubeb_alsa.c
 +++ b/media/libcubeb/src/cubeb_alsa.c
-@@ -1009,6 +1009,21 @@ alsa_stream_get_position(cubeb_stream * 
+@@ -1004,19 +1004,35 @@ alsa_stream_get_position(cubeb_stream * 
+   }
+ 
+   stm->last_position = *position;
+ 
+   pthread_mutex_unlock(&stm->mutex);
    return CUBEB_OK;
  }
  
@@ -85,7 +117,9 @@ diff --git a/media/libcubeb/src/cubeb_alsa.c b/media/libcubeb/src/cubeb_alsa.c
  static struct cubeb_ops const alsa_ops = {
    .init = alsa_init,
    .get_backend_id = alsa_get_backend_id,
-@@ -1018,5 +1033,6 @@ static struct cubeb_ops const alsa_ops =
+   .get_max_channel_count = alsa_get_max_channel_count,
+   .destroy = alsa_destroy,
+   .stream_init = alsa_stream_init,
    .stream_destroy = alsa_stream_destroy,
    .stream_start = alsa_stream_start,
    .stream_stop = alsa_stream_stop,
@@ -96,7 +130,11 @@ diff --git a/media/libcubeb/src/cubeb_alsa.c b/media/libcubeb/src/cubeb_alsa.c
 diff --git a/media/libcubeb/src/cubeb_audiotrack.c b/media/libcubeb/src/cubeb_audiotrack.c
 --- a/media/libcubeb/src/cubeb_audiotrack.c
 +++ b/media/libcubeb/src/cubeb_audiotrack.c
-@@ -5,7 +5,9 @@
+@@ -1,16 +1,18 @@
+ /*
+  * Copyright © 2013 Mozilla Foundation
+  *
+  * This program is made available under an ISC-style license.  See the
   * accompanying file LICENSE for details.
   */
  
@@ -106,7 +144,17 @@ diff --git a/media/libcubeb/src/cubeb_audiotrack.c b/media/libcubeb/src/cubeb_au
  #include <assert.h>
  #include <pthread.h>
  #include <stdlib.h>
-@@ -320,6 +322,7 @@ audiotrack_stream_init(cubeb * ctx, cube
+ #include <time.h>
+ #include <dlfcn.h>
+ #include "android/log.h"
+ 
+ #include "cubeb/cubeb.h"
+@@ -315,16 +317,17 @@ audiotrack_stream_init(cubeb * ctx, cube
+       stream_params.format == CUBEB_SAMPLE_FLOAT32BE) {
+     return CUBEB_ERROR_INVALID_FORMAT;
+   }
+ 
+   if (audiotrack_get_min_frame_count(ctx, &stream_params, &min_frame_count)) {
      return CUBEB_ERROR;
    }
  
@@ -114,7 +162,17 @@ diff --git a/media/libcubeb/src/cubeb_audiotrack.c b/media/libcubeb/src/cubeb_au
    stm = calloc(1, sizeof(*stm));
    assert(stm);
  
-@@ -424,6 +427,18 @@ audiotrack_stream_get_position(cubeb_str
+   stm->context = ctx;
+   stm->data_callback = data_callback;
+   stm->state_callback = state_callback;
+   stm->user_ptr = user_ptr;
+   stm->params = stream_params;
+@@ -419,19 +422,32 @@ audiotrack_stream_get_position(cubeb_str
+ 
+   assert(stream->instance && position);
+   stream->context->klass.get_position(stream->instance, &p);
+   *position = p;
+ 
    return CUBEB_OK;
  }
  
@@ -133,7 +191,9 @@ diff --git a/media/libcubeb/src/cubeb_audiotrack.c b/media/libcubeb/src/cubeb_au
  static struct cubeb_ops const audiotrack_ops = {
    .init = audiotrack_init,
    .get_backend_id = audiotrack_get_backend_id,
-@@ -433,5 +448,6 @@ static struct cubeb_ops const audiotrack
+   .get_max_channel_count = audiotrack_get_max_channel_count,
+   .destroy = audiotrack_destroy,
+   .stream_init = audiotrack_stream_init,
    .stream_destroy = audiotrack_stream_destroy,
    .stream_start = audiotrack_stream_start,
    .stream_stop = audiotrack_stream_stop,
@@ -144,7 +204,12 @@ diff --git a/media/libcubeb/src/cubeb_audiotrack.c b/media/libcubeb/src/cubeb_au
 diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_audiounit.c
 --- a/media/libcubeb/src/cubeb_audiounit.c
 +++ b/media/libcubeb/src/cubeb_audiounit.c
-@@ -10,6 +10,7 @@
+@@ -5,41 +5,59 @@
+  * accompanying file LICENSE for details.
+  */
+ #undef NDEBUG
+ #include <assert.h>
+ #include <pthread.h>
  #include <stdlib.h>
  #include <AudioUnit/AudioUnit.h>
  #include <CoreAudio/AudioHardware.h>
@@ -152,7 +217,11 @@ diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_aud
  #include "cubeb/cubeb.h"
  #include "cubeb-internal.h"
  
-@@ -21,6 +22,8 @@ struct cubeb {
+ #define NBUFS 4
+ 
+ static struct cubeb_ops const audiounit_ops;
+ 
+ struct cubeb {
    struct cubeb_ops const * ops;
  };
  
@@ -161,7 +230,12 @@ diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_aud
  struct cubeb_stream {
    cubeb * context;
    AudioUnit unit;
-@@ -33,8 +36,23 @@ struct cubeb_stream {
+   cubeb_data_callback data_callback;
+   cubeb_state_callback state_callback;
+   void * user_ptr;
+   AudioStreamBasicDescription sample_spec;
+   pthread_mutex_t mutex;
+   uint64_t frames_played;
    uint64_t frames_queued;
    int shutdown;
    int draining;
@@ -185,7 +259,17 @@ diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_aud
  static OSStatus
  audiounit_output_callback(void * user_ptr, AudioUnitRenderActionFlags * flags,
                            AudioTimeStamp const * tstamp, UInt32 bus, UInt32 nframes,
-@@ -52,6 +70,8 @@ audiounit_output_callback(void * user_pt
+                           AudioBufferList * bufs)
+ {
+   cubeb_stream * stm;
+   unsigned char * buf;
+   long got;
+@@ -47,16 +65,18 @@ audiounit_output_callback(void * user_pt
+ 
+   assert(bufs->mNumberBuffers == 1);
+   buf = bufs->mBuffers[0].mData;
+ 
+   stm = user_ptr;
  
    pthread_mutex_lock(&stm->mutex);
  
@@ -194,7 +278,17 @@ diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_aud
    if (stm->draining || stm->shutdown) {
      pthread_mutex_unlock(&stm->mutex);
      if (stm->draining) {
-@@ -255,6 +275,8 @@ audiounit_stream_init(cubeb * context, c
+       r = AudioOutputUnitStop(stm->unit);
+       assert(r == 0);
+       stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_DRAINED);
+     }
+     return noErr;
+@@ -250,16 +270,18 @@ audiounit_stream_init(cubeb * context, c
+ 
+   stm->sample_spec = ss;
+ 
+   r = pthread_mutex_init(&stm->mutex, NULL);
+   assert(r == 0);
  
    stm->frames_played = 0;
    stm->frames_queued = 0;
@@ -203,7 +297,17 @@ diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_aud
  
  #if MAC_OS_X_VERSION_MIN_REQUIRED < 1060
    r = OpenAComponent(comp, &stm->unit);
-@@ -351,6 +373,90 @@ audiounit_stream_get_position(cubeb_stre
+ #else
+   r = AudioComponentInstanceNew(comp, &stm->unit);
+ #endif
+   if (r != 0) {
+     audiounit_stream_destroy(stm);
+@@ -346,19 +368,104 @@ static int
+ audiounit_stream_get_position(cubeb_stream * stm, uint64_t * position)
+ {
+   pthread_mutex_lock(&stm->mutex);
+   *position = stm->frames_played;
+   pthread_mutex_unlock(&stm->mutex);
    return CUBEB_OK;
  }
  
@@ -294,7 +398,9 @@ diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_aud
  static struct cubeb_ops const audiounit_ops = {
    .init = audiounit_init,
    .get_backend_id = audiounit_get_backend_id,
-@@ -360,5 +466,6 @@ static struct cubeb_ops const audiounit_
+   .get_max_channel_count = audiounit_get_max_channel_count,
+   .destroy = audiounit_destroy,
+   .stream_init = audiounit_stream_init,
    .stream_destroy = audiounit_stream_destroy,
    .stream_start = audiounit_stream_start,
    .stream_stop = audiounit_stream_stop,
@@ -305,7 +411,12 @@ diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_aud
 diff --git a/media/libcubeb/src/cubeb_opensl.c b/media/libcubeb/src/cubeb_opensl.c
 --- a/media/libcubeb/src/cubeb_opensl.c
 +++ b/media/libcubeb/src/cubeb_opensl.c
-@@ -413,6 +413,14 @@ opensl_stream_get_position(cubeb_stream 
+@@ -408,19 +408,28 @@ opensl_stream_get_position(cubeb_stream 
+   SLmillisecond msec;
+   SLresult res = (*stm->play)->GetPosition(stm->play, &msec);
+   if (res != SL_RESULT_SUCCESS)
+     return CUBEB_ERROR;
+   *position = (stm->bytespersec / (1000 * stm->framesize)) * msec;
    return CUBEB_OK;
  }
  
@@ -320,7 +431,9 @@ diff --git a/media/libcubeb/src/cubeb_opensl.c b/media/libcubeb/src/cubeb_opensl
  static struct cubeb_ops const opensl_ops = {
    .init = opensl_init,
    .get_backend_id = opensl_get_backend_id,
-@@ -422,5 +430,6 @@ static struct cubeb_ops const opensl_ops
+   .get_max_channel_count = opensl_get_max_channel_count,
+   .destroy = opensl_destroy,
+   .stream_init = opensl_stream_init,
    .stream_destroy = opensl_stream_destroy,
    .stream_start = opensl_stream_start,
    .stream_stop = opensl_stream_stop,
@@ -331,7 +444,12 @@ diff --git a/media/libcubeb/src/cubeb_opensl.c b/media/libcubeb/src/cubeb_opensl
 diff --git a/media/libcubeb/src/cubeb_pulse.c b/media/libcubeb/src/cubeb_pulse.c
 --- a/media/libcubeb/src/cubeb_pulse.c
 +++ b/media/libcubeb/src/cubeb_pulse.c
-@@ -13,6 +13,8 @@
+@@ -8,16 +8,18 @@
+ #include <assert.h>
+ #include <dlfcn.h>
+ #include <stdlib.h>
+ #include <pulse/pulseaudio.h>
+ #include <string.h>
  #include "cubeb/cubeb.h"
  #include "cubeb-internal.h"
  
@@ -340,7 +458,17 @@ diff --git a/media/libcubeb/src/cubeb_pulse.c b/media/libcubeb/src/cubeb_pulse.c
  #ifdef DISABLE_LIBPULSE_DLOPEN
  #define WRAP(x) x
  #else
-@@ -568,6 +570,28 @@ pulse_stream_get_position(cubeb_stream *
+ #define WRAP(x) cubeb_##x
+ #define MAKE_TYPEDEF(x) static typeof(x) * cubeb_##x
+ MAKE_TYPEDEF(pa_channel_map_init_auto);
+ MAKE_TYPEDEF(pa_context_connect);
+ MAKE_TYPEDEF(pa_context_disconnect);
+@@ -563,19 +565,42 @@ pulse_stream_get_position(cubeb_stream *
+   }
+ 
+   bytes = WRAP(pa_usec_to_bytes)(r_usec, &stm->sample_spec);
+   *position = bytes / WRAP(pa_frame_size)(&stm->sample_spec);
+ 
    return CUBEB_OK;
  }
  
@@ -369,7 +497,9 @@ diff --git a/media/libcubeb/src/cubeb_pulse.c b/media/libcubeb/src/cubeb_pulse.c
  static struct cubeb_ops const pulse_ops = {
    .init = pulse_init,
    .get_backend_id = pulse_get_backend_id,
-@@ -577,5 +601,6 @@ static struct cubeb_ops const pulse_ops 
+   .get_max_channel_count = pulse_get_max_channel_count,
+   .destroy = pulse_destroy,
+   .stream_init = pulse_stream_init,
    .stream_destroy = pulse_stream_destroy,
    .stream_start = pulse_stream_start,
    .stream_stop = pulse_stream_stop,
@@ -380,7 +510,12 @@ diff --git a/media/libcubeb/src/cubeb_pulse.c b/media/libcubeb/src/cubeb_pulse.c
 diff --git a/media/libcubeb/src/cubeb_sndio.c b/media/libcubeb/src/cubeb_sndio.c
 --- a/media/libcubeb/src/cubeb_sndio.c
 +++ b/media/libcubeb/src/cubeb_sndio.c
-@@ -314,6 +314,14 @@ sndio_stream_set_volume(cubeb_stream *s,
+@@ -309,18 +309,27 @@ sndio_stream_set_volume(cubeb_stream *s,
+ {
+   DPR("sndio_stream_set_volume(%f)\n", volume);
+   pthread_mutex_lock(&s->mtx);
+   sio_setvol(s->hdl, SIO_MAXVOL * volume);
+   pthread_mutex_unlock(&s->mtx);
    return CUBEB_OK;
  }
  
@@ -395,7 +530,8 @@ diff --git a/media/libcubeb/src/cubeb_sndio.c b/media/libcubeb/src/cubeb_sndio.c
  static struct cubeb_ops const sndio_ops = {
    .init = sndio_init,
    .get_backend_id = sndio_get_backend_id,
-@@ -322,5 +330,6 @@ static struct cubeb_ops const sndio_ops 
+   .destroy = sndio_destroy,
+   .stream_init = sndio_stream_init,
    .stream_destroy = sndio_stream_destroy,
    .stream_start = sndio_stream_start,
    .stream_stop = sndio_stream_stop,
@@ -406,7 +542,12 @@ diff --git a/media/libcubeb/src/cubeb_sndio.c b/media/libcubeb/src/cubeb_sndio.c
 diff --git a/media/libcubeb/src/cubeb_winmm.c b/media/libcubeb/src/cubeb_winmm.c
 --- a/media/libcubeb/src/cubeb_winmm.c
 +++ b/media/libcubeb/src/cubeb_winmm.c
-@@ -64,6 +64,7 @@ struct cubeb_stream {
+@@ -59,16 +59,17 @@ struct cubeb_stream {
+   size_t buffer_size;
+   int next_buffer;
+   int free_buffers;
+   int shutdown;
+   int draining;
    HANDLE event;
    HWAVEOUT waveout;
    CRITICAL_SECTION lock;
@@ -414,7 +555,17 @@ diff --git a/media/libcubeb/src/cubeb_winmm.c b/media/libcubeb/src/cubeb_winmm.c
  };
  
  static size_t
-@@ -136,6 +137,7 @@ winmm_refill_stream(cubeb_stream * stm)
+ bytes_per_frame(cubeb_stream_params params)
+ {
+   size_t bytes;
+ 
+   switch (params.format) {
+@@ -131,16 +132,17 @@ winmm_refill_stream(cubeb_stream * stm)
+ 
+   wanted = (DWORD) stm->buffer_size / bytes_per_frame(stm->params);
+ 
+   /* It is assumed that the caller is holding this lock.  It must be dropped
+      during the callback to avoid deadlocks. */
    LeaveCriticalSection(&stm->lock);
    got = stm->data_callback(stm, stm->user_ptr, hdr->lpData, wanted);
    EnterCriticalSection(&stm->lock);
@@ -422,7 +573,17 @@ diff --git a/media/libcubeb/src/cubeb_winmm.c b/media/libcubeb/src/cubeb_winmm.c
    if (got < 0) {
      LeaveCriticalSection(&stm->lock);
      /* XXX handle this case */
-@@ -389,6 +391,7 @@ winmm_stream_init(cubeb * context, cubeb
+     assert(0);
+     return;
+   } else if (got < wanted) {
+     stm->draining = 1;
+   }
+@@ -384,16 +386,17 @@ winmm_stream_init(cubeb * context, cubeb
+ 
+   stm->context = context;
+ 
+   stm->params = stream_params;
+ 
    stm->data_callback = data_callback;
    stm->state_callback = state_callback;
    stm->user_ptr = user_ptr;
@@ -430,7 +591,17 @@ diff --git a/media/libcubeb/src/cubeb_winmm.c b/media/libcubeb/src/cubeb_winmm.c
  
    if (latency < context->minimum_latency) {
      latency = context->minimum_latency;
-@@ -574,6 +577,24 @@ winmm_stream_get_position(cubeb_stream *
+   }
+ 
+   bufsz = (size_t) (stm->params.rate / 1000.0 * latency * bytes_per_frame(stm->params) / NBUFS);
+   if (bufsz % bytes_per_frame(stm->params) != 0) {
+     bufsz += bytes_per_frame(stm->params) - (bufsz % bytes_per_frame(stm->params));
+@@ -569,19 +572,38 @@ winmm_stream_get_position(cubeb_stream *
+     return CUBEB_ERROR;
+   }
+ 
+   *position = time.u.sample;
+ 
    return CUBEB_OK;
  }
  
@@ -455,7 +626,9 @@ diff --git a/media/libcubeb/src/cubeb_winmm.c b/media/libcubeb/src/cubeb_winmm.c
  static struct cubeb_ops const winmm_ops = {
    /*.init =*/ winmm_init,
    /*.get_backend_id =*/ winmm_get_backend_id,
-@@ -583,5 +604,6 @@ static struct cubeb_ops const winmm_ops 
+   /*.get_max_channel_count=*/ winmm_get_max_channel_count,
+   /*.destroy =*/ winmm_destroy,
+   /*.stream_init =*/ winmm_stream_init,
    /*.stream_destroy =*/ winmm_stream_destroy,
    /*.stream_start =*/ winmm_stream_start,
    /*.stream_stop =*/ winmm_stream_stop,
