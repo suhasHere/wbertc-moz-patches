@@ -1,0 +1,186 @@
+# HG changeset patch
+# Parent 5f695ef3a09c2d8dd742d063283607cf57ea1a8b
+# User Paul Adenot <paul@paul.cx>
+Bug 785584 - Add a content API to set the requested latency
+
+diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
+--- a/content/media/AudioStream.cpp
++++ b/content/media/AudioStream.cpp
+@@ -94,8 +94,9 @@ static cubeb* GetCubebContext()
+ 
+ static uint32_t GetCubebLatency()
+ {
+-  MutexAutoLock lock(*gAudioPrefsLock);
+-  return gCubebLatency;
++  return static_cast<uint32_t>(AsyncLatencyLogger::Get()->GetRequestedLatency());
++  //MutexAutoLock lock(*gAudioPrefsLock);
++  //return gCubebLatency;
+ }
+ #endif
+ 
+@@ -921,7 +922,9 @@ BufferedAudioStream::DataCallback(void* 
+       NS_WARNING("Could not get latency from cubeb.");
+     }
+     LogLatency(AsyncLatencyLogger::AudioStream, static_cast<double>(mBuffer.Length()) / mOutRate * 1000.);
+-    LogLatency(AsyncLatencyLogger::Cubeb, (double) static_cast<double>(latency) / mOutRate * 1000.);
++    double latency_ms = (double) static_cast<double>(latency) / mOutRate * 1000.;
++    LogLatency(AsyncLatencyLogger::Cubeb, latency_ms);
++    AsyncLatencyLogger::Get()->SetActualLatency(latency_ms);
+   }
+ 
+   mAudioClock.UpdateWritePosition(servicedFrames);
+diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
+--- a/content/media/Latency.cpp
++++ b/content/media/Latency.cpp
+@@ -4,6 +4,27 @@
+ #include <cmath>
+ #include <algorithm>
+ 
++// latency targets, in ms, per platform
++#ifdef XP_WIN
++  // Windows: cubeb uses winmm, we can't do much here.
++  #define DEFAULT_LATENCY_TARGET 100
++#elif defined(XP_UNIX)
++  #if defined(XP_MACOSX)
++    // This works locally, need to test on more OSX devices.
++    #define DEFAULT_LATENCY_TARGET 20
++  #else
++    #ifndef ANDROID
++      // Linux desktop: we should be able to target 40ms latency using either alsa or pulse
++      #define DEFAULT_LATENCY_TARGET 40
++    #else
++      // Android, B2G TODO: handle fast-mixer enabled devices here, we might be
++      // able to reach the 10ms range on some device that can run fennec. The
++      // other devices and b2g have terrible backends.
++      #define DEFAULT_LATENCY_TARGET 100
++    #endif
++  #endif
++#endif
++
+ using namespace mozilla;
+ 
+ const char* LatencyLogIndex2Strings[] = {
+@@ -89,7 +110,9 @@ AsyncLatencyLogger* AsyncLatencyLogger::
+ 
+ AsyncLatencyLogger::AsyncLatencyLogger()
+   : mThread(nullptr),
+-    mMediaLatencyLog(nullptr)
++    mMediaLatencyLog(nullptr),
++    mRequestedLatency(DEFAULT_LATENCY_TARGET),
++    mActualLatency(0.0)
+ { }
+ 
+ AsyncLatencyLogger::~AsyncLatencyLogger()
+@@ -142,3 +165,31 @@ void AsyncLatencyLogger::Log(LatencyLogI
+   }
+ }
+ 
++nsresult AsyncLatencyLogger::SetRequestedLatency(double aRequestedLatency)
++{
++  MonitorAutoLock mon(*mMonitor);
++  // less than 1ms is not going to be achieved by anybody in userspace anyways.
++  if (aRequestedLatency < 1) {
++    return NS_ERROR_FAILURE;
++  }
++  mRequestedLatency = aRequestedLatency;
++  return NS_OK;
++}
++
++double AsyncLatencyLogger::GetRequestedLatency()
++{
++  MonitorAutoLock mon(*mMonitor);
++  return mRequestedLatency;
++}
++
++double AsyncLatencyLogger::GetActualLatency()
++{
++  MonitorAutoLock mon(*mMonitor);
++  return mActualLatency;
++}
++
++void AsyncLatencyLogger::SetActualLatency(double aLatency)
++{
++  MonitorAutoLock mon(*mMonitor);
++  mActualLatency = aLatency;
++}
+diff --git a/content/media/Latency.h b/content/media/Latency.h
+--- a/content/media/Latency.h
++++ b/content/media/Latency.h
+@@ -30,6 +30,11 @@ class AsyncLatencyLogger
+       void WriteLog(LatencyLogIndex index, double value);
+       void WriteLog(LatencyLogIndex index, const char* value);
+ 
++      nsresult SetRequestedLatency(double aLatency);
++      double GetRequestedLatency();
++      double GetActualLatency();
++      void SetActualLatency(double aLatency);
++
+       static AsyncLatencyLogger* Get(bool aStartTimer = false);
+       static void InitializeStatics();
+       static void Shutdown();
+@@ -49,6 +54,8 @@ class AsyncLatencyLogger
+       // initialization sequence. It is initialized at layout startup, and
+       // destroyed at layout shutdown.
+       static mozilla::Monitor* mMonitor;
++      double mRequestedLatency;
++      double mActualLatency;
+ };
+ 
+ void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, double value);
+diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
+--- a/dom/base/Navigator.cpp
++++ b/dom/base/Navigator.cpp
+@@ -479,6 +479,26 @@ Navigator::GetPlugins(ErrorResult& aRv)
+   return mPlugins;
+ }
+ 
++NS_IMETHODIMP
++Navigator::SetMozRequestedLatency(double aLatency)
++{
++  return AsyncLatencyLogger::Get()->SetRequestedLatency(aLatency);
++}
++
++NS_IMETHODIMP
++Navigator::GetMozRequestedLatency(double* aLatency)
++{
++  *aLatency = AsyncLatencyLogger::Get()->GetRequestedLatency();
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++Navigator::GetMozActualLatency(double* aLatency)
++{
++  *aLatency = AsyncLatencyLogger::Get()->GetActualLatency();
++  return NS_OK;
++}
++
+ // Values for the network.cookie.cookieBehavior pref are documented in
+ // nsCookieService.cpp.
+ #define COOKIE_BEHAVIOR_REJECT 2
+diff --git a/dom/interfaces/base/nsIDOMNavigator.idl b/dom/interfaces/base/nsIDOMNavigator.idl
+--- a/dom/interfaces/base/nsIDOMNavigator.idl
++++ b/dom/interfaces/base/nsIDOMNavigator.idl
+@@ -23,4 +23,7 @@ interface nsIDOMNavigator : nsISupports
+   readonly attribute DOMString             userAgent;
+   readonly attribute DOMString             buildID;
+   readonly attribute DOMString             doNotTrack;
++           attribute double               mozRequestedLatency;
++  readonly attribute double                mozActualLatency;
++ 
+ };
+diff --git a/graph.py b/graph.py
+--- a/graph.py
++++ b/graph.py
+@@ -25,10 +25,11 @@ def compute_sum(data):
+ def clean_data(raw_data):
+     '''
+     Remove the PR_LOG cruft at the beginning of each line and returns a list of
+-    tuple.
++    tuple. And ignore lines beginning by #
+     '''
+     out = []
+     for line in raw_data:
++      if line[0] != "#":
+         out.append(line.split(": ")[1])
+     return out
+ 

@@ -1,0 +1,158 @@
+# HG changeset patch
+# Parent e2bd74a73a716aee99bd0fcc12d2a5f43d024efb
+# User Paul Adenot <paul@paul.cx>
+Bug 785584 Added the possibility to mark a location in the log
+
+diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
+--- a/content/media/AudioStream.cpp
++++ b/content/media/AudioStream.cpp
+@@ -579,7 +579,7 @@ BufferedAudioStream::Init(int32_t aNumCh
+   // Size mBuffer for one second of audio.  This value is arbitrary, and was
+   // selected based on the observed behaviour of the existing AudioStream
+   // implementations.
+-  uint32_t bufferLimit = FramesToBytes(aRate);
++  uint32_t bufferLimit = FramesToBytes(aRate / 10);
+   NS_ABORT_IF_FALSE(bufferLimit % mBytesPerFrame == 0, "Must buffer complete frames");
+   mBuffer.SetCapacity(bufferLimit);
+ 
+@@ -886,6 +886,16 @@ BufferedAudioStream::DataCallback(void* 
+ 
+     // Notify any blocked Write() call that more space is available in mBuffer.
+     mon.NotifyAll();
++    bool isSilence = true;
++    for (uint32_t i = 0; i < servicedFrames; i++) {
++      if (output[i] != 0.0f) {
++        isSilence = false;
++        break;
++      }
++    }
++    if (isSilence) {
++      LogLatency(AsyncLatencyLogger::AudioStream, "Buffer is silent");
++    }
+   }
+ 
+   underrunFrames = aFrames - servicedFrames;
+diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
+--- a/content/media/Latency.cpp
++++ b/content/media/Latency.cpp
+@@ -10,7 +10,8 @@ const char* LatencyLogIndex2Strings[] = 
+   "MediaStream",
+   "Cubeb",
+   "AudioStream",
+-  "NetStat"
++  "NetStat",
++  "AudioBufferSourceNode"
+ };
+ 
+ AsyncLatencyLogger* gAsyncLogger = nullptr;
+@@ -21,18 +22,29 @@ class LogEvent : public nsRunnable
+ public:
+   LogEvent(AsyncLatencyLogger::LatencyLogIndex aIndex, double aValue) :
+     mIndex(aIndex),
+-    mValue(aValue)
++    mValue(aValue),
++    mMsg(nullptr)
++  {}
++  LogEvent(AsyncLatencyLogger::LatencyLogIndex aIndex, const char* aMsg) :
++    mIndex(aIndex),
++    mValue(0),
++    mMsg(aMsg)
+   {}
+   ~LogEvent() {}
+ 
+   NS_IMETHOD Run() {
+-    AsyncLatencyLogger::Get(true)->WriteLog(mIndex, mValue);
++    if (mMsg == nullptr) {
++      AsyncLatencyLogger::Get(true)->WriteLog(mIndex, mValue);
++    } else {
++      AsyncLatencyLogger::Get(true)->WriteLog(mIndex, mMsg);
++    }
+     return NS_OK;
+   }
+ 
+ protected:
+   AsyncLatencyLogger::LatencyLogIndex mIndex;
+   double mValue;
++  const char* mMsg;
+ };
+ 
+ // This is the only function that clients should use.
+@@ -41,6 +53,11 @@ void LogLatency(AsyncLatencyLogger::Late
+   AsyncLatencyLogger::Get()->Log(aIndex, aValue);
+ }
+ 
++void LogLatency(AsyncLatencyLogger::LatencyLogIndex aIndex, const char* msg)
++{
++  AsyncLatencyLogger::Get()->Log(aIndex, msg);
++}
++
+ void AsyncLatencyLogger::InitializeStatics()
+ {
+   AsyncLatencyLogger::mMonitor = new Monitor("MediaLatencyLogMonitor");
+@@ -98,6 +115,11 @@ void AsyncLatencyLogger::WriteLog(Latenc
+   PR_LOG(mMediaLatencyLog, PR_LOG_DEBUG, ("%s,%lf,%lf", LatencyLogIndex2Strings[aIndex], GetTimeStamp(), aValue));
+ }
+ 
++void AsyncLatencyLogger::WriteLog(LatencyLogIndex aIndex, const char* aMsg)
++{
++  PR_LOG(mMediaLatencyLog, PR_LOG_DEBUG, ("#%s,%lf,%s", LatencyLogIndex2Strings[aIndex], GetTimeStamp(), aMsg));
++}
++
+ double AsyncLatencyLogger::GetTimeStamp()
+ {
+   TimeDuration t = TimeStamp::Now() - mStart;
+@@ -112,3 +134,11 @@ void AsyncLatencyLogger::Log(LatencyLogI
+   }
+ }
+ 
++void AsyncLatencyLogger::Log(LatencyLogIndex aIndex, const char* aValue)
++{
++  nsCOMPtr<nsIRunnable> event = new LogEvent(aIndex, aValue);
++  if (mThread) {
++    mThread->Dispatch(event, NS_DISPATCH_NORMAL);
++  }
++}
++
+diff --git a/content/media/Latency.h b/content/media/Latency.h
+--- a/content/media/Latency.h
++++ b/content/media/Latency.h
+@@ -22,10 +22,13 @@ class AsyncLatencyLogger
+           Cubeb,
+           AudioStream,
+           NetEQ,
++          AudioBufferSourceNode,
+           _MAX_INDEX
+       };
+       void Log(LatencyLogIndex index, double value);
++      void Log(LatencyLogIndex index, const char* msg);
+       void WriteLog(LatencyLogIndex index, double value);
++      void WriteLog(LatencyLogIndex index, const char* value);
+ 
+       static AsyncLatencyLogger* Get(bool aStartTimer = false);
+       static void InitializeStatics();
+@@ -49,5 +52,6 @@ class AsyncLatencyLogger
+ };
+ 
+ void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, double value);
++void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, char const* msg);
+ 
+ #endif
+diff --git a/content/media/MediaStreamGraph.cpp b/content/media/MediaStreamGraph.cpp
+--- a/content/media/MediaStreamGraph.cpp
++++ b/content/media/MediaStreamGraph.cpp
+@@ -790,6 +790,7 @@ MediaStreamGraphImpl::PlayAudio(MediaStr
+         TrackTicks endTicks =
+             TimeToTicksRoundDown(track->GetRate(), audioOutput.mBlockedAudioTime);
+ 
++        LogLatency(AsyncLatencyLogger::MediaStream, "Writing silence");
+         output.InsertNullDataAtStart(endTicks - startTicks);
+         LOG(PR_LOG_DEBUG+1, ("MediaStream %p writing blocking-silence samples for %f to %f",
+                              aStream, MediaTimeToSeconds(t), MediaTimeToSeconds(end)));
+@@ -811,6 +812,7 @@ MediaStreamGraphImpl::PlayAudio(MediaStr
+         output.AppendNullData(endTicks - sliceEnd);
+         NS_ASSERTION(endTicks == sliceEnd || track->IsEnded(),
+                      "Ran out of data but track not ended?");
++        LogLatency(AsyncLatencyLogger::MediaStream, "Writing real data.");
+         output.ApplyVolume(volume);
+         LOG(PR_LOG_DEBUG+1, ("MediaStream %p writing samples for %f to %f (samples %lld to %lld)",
+                              aStream, MediaTimeToSeconds(t), MediaTimeToSeconds(end),
