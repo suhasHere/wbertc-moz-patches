@@ -6,7 +6,12 @@ Bug 785584 - Add a content API to set the requested latency
 diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
 --- a/content/media/AudioStream.cpp
 +++ b/content/media/AudioStream.cpp
-@@ -94,8 +94,9 @@ static cubeb* GetCubebContext()
+@@ -89,18 +89,19 @@ static cubeb* GetCubebContext()
+     return gCubebContext;
+   }
+   NS_WARNING("cubeb_init failed");
+   return nullptr;
+ }
  
  static uint32_t GetCubebLatency()
  {
@@ -18,7 +23,17 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
  }
  #endif
  
-@@ -921,7 +922,9 @@ BufferedAudioStream::DataCallback(void* 
+ #if defined(MOZ_CUBEB) && defined(__ANDROID__) && defined(MOZ_B2G)
+ static cubeb_stream_type ConvertChannelToCubebType(dom::AudioChannelType aType)
+ {
+   switch(aType) {
+     case dom::AUDIO_CHANNEL_NORMAL:
+@@ -916,17 +917,19 @@ BufferedAudioStream::DataCallback(void* 
+   WriteDumpFile(mDumpFile, this, aFrames, aBuffer);
+   mLatency -= servicedFrames;
+   {
+     uint32_t latency = -1;
+     if (cubeb_stream_get_latency(mCubebStream, &latency)) {
        NS_WARNING("Could not get latency from cubeb.");
      }
      LogLatency(AsyncLatencyLogger::AudioStream, static_cast<double>(mBuffer.Length()) / mOutRate * 1000.);
@@ -29,10 +44,18 @@ diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
    }
  
    mAudioClock.UpdateWritePosition(servicedFrames);
+   return servicedFrames;
+ }
+ 
+ void
+ BufferedAudioStream::StateCallback(cubeb_state aState)
 diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
 --- a/content/media/Latency.cpp
 +++ b/content/media/Latency.cpp
-@@ -4,6 +4,27 @@
+@@ -1,14 +1,35 @@
+ #include "Latency.h"
+ #include "nsThreadUtils.h"
+ #include <prlog.h>
  #include <cmath>
  #include <algorithm>
  
@@ -60,7 +83,17 @@ diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
  using namespace mozilla;
  
  const char* LatencyLogIndex2Strings[] = {
-@@ -89,7 +110,9 @@ AsyncLatencyLogger* AsyncLatencyLogger::
+   "MediaStream",
+   "Cubeb",
+   "AudioStream",
+   "NetStat",
+   "AudioBufferSourceNode"
+@@ -84,17 +105,19 @@ AsyncLatencyLogger* AsyncLatencyLogger::
+       }
+     }
+   }
+   return gAsyncLogger;
+ }
  
  AsyncLatencyLogger::AsyncLatencyLogger()
    : mThread(nullptr),
@@ -71,7 +104,17 @@ diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
  { }
  
  AsyncLatencyLogger::~AsyncLatencyLogger()
-@@ -142,3 +165,31 @@ void AsyncLatencyLogger::Log(LatencyLogI
+ {
+   MonitorAutoLock mon(*mMonitor);
+   if (mThread) {
+     mThread->Shutdown();
+   }
+@@ -137,8 +160,36 @@ void AsyncLatencyLogger::Log(LatencyLogI
+ void AsyncLatencyLogger::Log(LatencyLogIndex aIndex, const char* aValue)
+ {
+   nsCOMPtr<nsIRunnable> event = new LogEvent(aIndex, aValue);
+   if (mThread) {
+     mThread->Dispatch(event, NS_DISPATCH_NORMAL);
    }
  }
  
@@ -106,7 +149,12 @@ diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
 diff --git a/content/media/Latency.h b/content/media/Latency.h
 --- a/content/media/Latency.h
 +++ b/content/media/Latency.h
-@@ -30,6 +30,11 @@ class AsyncLatencyLogger
+@@ -25,16 +25,21 @@ class AsyncLatencyLogger
+           AudioBufferSourceNode,
+           _MAX_INDEX
+       };
+       void Log(LatencyLogIndex index, double value);
+       void Log(LatencyLogIndex index, const char* msg);
        void WriteLog(LatencyLogIndex index, double value);
        void WriteLog(LatencyLogIndex index, const char* value);
  
@@ -118,7 +166,17 @@ diff --git a/content/media/Latency.h b/content/media/Latency.h
        static AsyncLatencyLogger* Get(bool aStartTimer = false);
        static void InitializeStatics();
        static void Shutdown();
-@@ -49,6 +54,8 @@ class AsyncLatencyLogger
+     private:
+       AsyncLatencyLogger();
+       ~AsyncLatencyLogger();
+       double GetTimeStamp();
+       void Init();
+@@ -44,14 +49,16 @@ class AsyncLatencyLogger
+       // monitor. After the initialization phase, it is accessed on the log
+       // thread only.
+       mozilla::TimeStamp mStart;
+       PRLogModuleInfo* mMediaLatencyLog;
+       // This monitor protects mStart and mMediaLatencyLog for the
        // initialization sequence. It is initialized at layout startup, and
        // destroyed at layout shutdown.
        static mozilla::Monitor* mMonitor;
@@ -127,10 +185,18 @@ diff --git a/content/media/Latency.h b/content/media/Latency.h
  };
  
  void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, double value);
+ void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, char const* msg);
+ 
+ #endif
 diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
 --- a/dom/base/Navigator.cpp
 +++ b/dom/base/Navigator.cpp
-@@ -479,6 +479,26 @@ Navigator::GetPlugins(ErrorResult& aRv)
+@@ -474,16 +474,36 @@ Navigator::GetPlugins(ErrorResult& aRv)
+     nsWeakPtr win = do_GetWeakReference(mWindow);
+     mPlugins = new nsPluginArray(win);
+     mPlugins->Init();
+   }
+ 
    return mPlugins;
  }
  
@@ -157,10 +223,20 @@ diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
  // Values for the network.cookie.cookieBehavior pref are documented in
  // nsCookieService.cpp.
  #define COOKIE_BEHAVIOR_REJECT 2
+ 
+ bool
+ Navigator::CookieEnabled()
+ {
+   bool cookieEnabled =
 diff --git a/dom/interfaces/base/nsIDOMNavigator.idl b/dom/interfaces/base/nsIDOMNavigator.idl
 --- a/dom/interfaces/base/nsIDOMNavigator.idl
 +++ b/dom/interfaces/base/nsIDOMNavigator.idl
-@@ -23,4 +23,7 @@ interface nsIDOMNavigator : nsISupports
+@@ -18,9 +18,12 @@ interface nsIDOMNavigator : nsISupports
+   readonly attribute DOMString             oscpu;
+   readonly attribute DOMString             vendor;
+   readonly attribute DOMString             vendorSub;
+   readonly attribute DOMString             product;
+   readonly attribute DOMString             productSub;
    readonly attribute DOMString             userAgent;
    readonly attribute DOMString             buildID;
    readonly attribute DOMString             doNotTrack;
@@ -171,7 +247,12 @@ diff --git a/dom/interfaces/base/nsIDOMNavigator.idl b/dom/interfaces/base/nsIDO
 diff --git a/graph.py b/graph.py
 --- a/graph.py
 +++ b/graph.py
-@@ -25,10 +25,11 @@ def compute_sum(data):
+@@ -20,20 +20,21 @@ def compute_sum(data):
+         out[0].append(i[1])
+         out[1].append(sum(last_values.values()))
+     return out
+ 
+ 
  def clean_data(raw_data):
      '''
      Remove the PR_LOG cruft at the beginning of each line and returns a list of
@@ -183,4 +264,28 @@ diff --git a/graph.py b/graph.py
 +      if line[0] != "#":
          out.append(line.split(": ")[1])
      return out
+ 
+ # returns a list of tuples
+ def parse_data(raw_lines):
+     '''
+     Split each line by , and put every bit in a tuple.
+     '''
+diff --git a/media/libcubeb/src/cubeb_wasapi.cpp b/media/libcubeb/src/cubeb_wasapi.cpp
+--- a/media/libcubeb/src/cubeb_wasapi.cpp
++++ b/media/libcubeb/src/cubeb_wasapi.cpp
+@@ -873,13 +873,13 @@ cubeb_ops const wasapi_ops = {
+   /*.init =*/ wasapi_init,
+   /*.get_backend_id =*/ wasapi_get_backend_id,
+   /*.get_max_channel_count*/ wasapi_get_max_channel_count,
+   /*.destroy =*/ wasapi_destroy,
+   /*.stream_init =*/ wasapi_stream_init,
+   /*.stream_destroy =*/ wasapi_stream_destroy,
+   /*.stream_start =*/ wasapi_stream_start,
+   /*.stream_stop =*/ wasapi_stream_stop,
+-  /*.stream_get_position =*/ wasapi_stream_get_position
+-  ///*.stream_get_latency =*/ wasapi_stream_get_latency
++  /*.stream_get_position =*/ wasapi_stream_get_position,
++  /*.stream_get_latency =*/ wasapi_stream_get_latency
+  };
+ } // namespace anonymous
  
