@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 5f695ef3a09c2d8dd742d063283607cf57ea1a8b
+# Parent c952d6557d5e5e88da11640fb6ab13c6aa6e5f0e
 # User Paul Adenot <paul@paul.cx>
 Bug 904617 Add a content API to set the requested latency
 
@@ -191,7 +191,7 @@ diff --git a/content/media/Latency.h b/content/media/Latency.h
 diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
 --- a/dom/base/Navigator.cpp
 +++ b/dom/base/Navigator.cpp
-@@ -474,16 +474,36 @@ Navigator::GetPlugins(ErrorResult& aRv)
+@@ -474,16 +474,34 @@ Navigator::GetPlugins(ErrorResult& aRv)
      nsWeakPtr win = do_GetWeakReference(mWindow);
      mPlugins = new nsPluginArray(win);
      mPlugins->Init();
@@ -200,24 +200,22 @@ diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
    return mPlugins;
  }
  
-+NS_IMETHODIMP
-+Navigator::SetMozRequestedLatency(double aLatency)
++void
++Navigator::SetMozRequestedLatency(double aLatency, ErrorResult& aRv)
 +{
-+  return AsyncLatencyLogger::Get()->SetRequestedLatency(aLatency);
++  aRv = AsyncLatencyLogger::Get()->SetRequestedLatency(aLatency);
 +}
 +
-+NS_IMETHODIMP
-+Navigator::GetMozRequestedLatency(double* aLatency)
++double
++Navigator::GetMozRequestedLatency(ErrorResult& aRv)
 +{
-+  *aLatency = AsyncLatencyLogger::Get()->GetRequestedLatency();
-+  return NS_OK;
++  return AsyncLatencyLogger::Get()->GetRequestedLatency();
 +}
 +
-+NS_IMETHODIMP
-+Navigator::GetMozActualLatency(double* aLatency)
++double
++Navigator::GetMozActualLatency(ErrorResult& aRv)
 +{
-+  *aLatency = AsyncLatencyLogger::Get()->GetActualLatency();
-+  return NS_OK;
++  return AsyncLatencyLogger::Get()->GetActualLatency();
 +}
 +
  // Values for the network.cookie.cookieBehavior pref are documented in
@@ -228,22 +226,56 @@ diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
  Navigator::CookieEnabled()
  {
    bool cookieEnabled =
-diff --git a/dom/interfaces/base/nsIDOMNavigator.idl b/dom/interfaces/base/nsIDOMNavigator.idl
---- a/dom/interfaces/base/nsIDOMNavigator.idl
-+++ b/dom/interfaces/base/nsIDOMNavigator.idl
-@@ -18,9 +18,12 @@ interface nsIDOMNavigator : nsISupports
-   readonly attribute DOMString             oscpu;
-   readonly attribute DOMString             vendor;
-   readonly attribute DOMString             vendorSub;
-   readonly attribute DOMString             product;
-   readonly attribute DOMString             productSub;
-   readonly attribute DOMString             userAgent;
-   readonly attribute DOMString             buildID;
-   readonly attribute DOMString             doNotTrack;
-+           attribute double               mozRequestedLatency;
-+  readonly attribute double                mozActualLatency;
-+ 
- };
+diff --git a/dom/base/Navigator.h b/dom/base/Navigator.h
+--- a/dom/base/Navigator.h
++++ b/dom/base/Navigator.h
+@@ -167,16 +167,22 @@ public:
+   // The XPCOM GetLanguage is OK
+   bool OnLine();
+   void RegisterProtocolHandler(const nsAString& aScheme, const nsAString& aURL,
+                                const nsAString& aTitle, ErrorResult& aRv);
+   void RegisterContentHandler(const nsAString& aMIMEType, const nsAString& aURL,
+                               const nsAString& aTitle, ErrorResult& aRv);
+   nsMimeTypeArray* GetMimeTypes(ErrorResult& aRv);
+   nsPluginArray* GetPlugins(ErrorResult& aRv);
++  
++  //WebIDL Latency APIs
++  void SetMozRequestedLatency(double aLatency, ErrorResult& aRv);
++  double GetMozRequestedLatency(ErrorResult& aRv);
++  double GetMozActualLatency(ErrorResult& aRv);
++
+   // The XPCOM GetDoNotTrack is ok
+   Geolocation* GetGeolocation(ErrorResult& aRv);
+   battery::BatteryManager* GetBattery(ErrorResult& aRv);
+   void Vibrate(uint32_t aDuration, ErrorResult& aRv);
+   void Vibrate(const nsTArray<uint32_t>& aDuration, ErrorResult& aRv);
+   void GetAppCodeName(nsString& aAppCodeName, ErrorResult& aRv)
+   {
+     aRv = GetAppCodeName(aAppCodeName);
+diff --git a/dom/webidl/Navigator.webidl b/dom/webidl/Navigator.webidl
+--- a/dom/webidl/Navigator.webidl
++++ b/dom/webidl/Navigator.webidl
+@@ -145,16 +145,20 @@ partial interface Navigator {
+   // WebKit/Blink supports this (hardcoded "20030107"); Trident/Presto don't
+   readonly attribute DOMString productSub;
+   // WebKit/Blink/Trident/Presto support this.
+   readonly attribute boolean cookieEnabled;
+   [Throws]
+   readonly attribute DOMString buildID;
+   [Throws, Func="Navigator::HasPowerSupport"]
+   readonly attribute MozPowerManager mozPower;
++  [Throws]
++  attribute double mozRequestedLatency;
++  [Throws]
++  readonly  attribute double mozActualLatency;
+ 
+   // WebKit/Blink/Trident/Presto support this.
+   [Throws]
+   boolean javaEnabled();
+   // Everyone but WebKit/Blink supports this.  See bug 679971.
+   boolean taintEnabled();
+ 
+   /**
 diff --git a/graph.py b/graph.py
 --- a/graph.py
 +++ b/graph.py
