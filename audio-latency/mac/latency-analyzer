@@ -1,0 +1,775 @@
+# HG changeset patch
+# User Paul Adenot <paul@paul.cx>
+# Date 1359397357 -3600
+# Node ID 42d2048c3339a8943574998f515f004dd2b79852
+# Parent d240ccdab8a37bfc485bf5fbe527c43c2219068a
+Bug 904617 - Log latency, and adds a python script to understand the log.
+
+diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
+--- a/content/media/AudioSegment.cpp
++++ b/content/media/AudioSegment.cpp
+@@ -2,16 +2,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "AudioSegment.h"
+ 
+ #include "AudioStream.h"
+ #include "AudioChannelFormat.h"
++#include "Latency.h"
+ 
+ namespace mozilla {
+ 
+ template <class SrcT, class DestT>
+ static void
+ InterleaveAndConvertBuffer(const SrcT** aSourceChannels,
+                            int32_t aLength, float aVolume,
+                            int32_t aChannels,
+@@ -178,15 +179,16 @@ AudioSegment::WriteTo(AudioStream* aOutp
+                                      outputChannels,
+                                      buf.Elements());
+         }
+       } else {
+         // Assumes that a bit pattern of zeroes == 0.0f
+         memset(buf.Elements(), 0, buf.Length()*sizeof(AudioDataValue));
+       }
+       aOutput->Write(buf.Elements(), int32_t(duration));
++      LogLatency(AsyncLatencyLogger::MediaStream, (mozilla::TimeStamp::Now() - c.mTimeStamp).ToMilliseconds());
+       offset += duration;
+     }
+   }
+   aOutput->Start();
+ }
+ 
+ }
+diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
+--- a/content/media/AudioSegment.h
++++ b/content/media/AudioSegment.h
+@@ -5,16 +5,19 @@
+ 
+ #ifndef MOZILLA_AUDIOSEGMENT_H_
+ #define MOZILLA_AUDIOSEGMENT_H_
+ 
+ #include "MediaSegment.h"
+ #include "nsISupportsImpl.h"
+ #include "AudioSampleFormat.h"
+ #include "SharedBuffer.h"
++#ifdef MOZILLA_INTERNAL_API
++#include "mozilla/TimeStamp.h"
++#endif
+ 
+ namespace mozilla {
+ 
+ class AudioStream;
+ 
+ /**
+  * For auto-arrays etc, guess this as the common number of channels.
+  */
+@@ -98,16 +101,19 @@ struct AudioChunk {
+     mVolume = 1.0f;
+   }
+ 
+   TrackTicks mDuration; // in frames within the buffer
+   nsRefPtr<ThreadSharedObject> mBuffer; // the buffer object whose lifetime is managed; null means data is all zeroes
+   nsTArray<const void*> mChannelData; // one pointer per channel; empty if and only if mBuffer is null
+   float mVolume; // volume multiplier to apply (1.0f if mBuffer is nonnull)
+   SampleFormat mBufferFormat; // format of frames in mBuffer (only meaningful if mBuffer is nonnull)
++#ifdef MOZILLA_INTERNAL_API
++  mozilla::TimeStamp mTimeStamp;           // time at which this has been fetched from the MediaEngine
++#endif
+ };
+ 
+ /**
+  * A list of audio samples consisting of a sequence of slices of SharedBuffers.
+  * The audio rate is determined by the track, not stored in this class.
+  */
+ class AudioSegment : public MediaSegmentBase<AudioSegment, AudioChunk> {
+ public:
+@@ -121,38 +127,47 @@ public:
+   {
+     AudioChunk* chunk = AppendChunk(aDuration);
+     chunk->mBuffer = aBuffer;
+     for (uint32_t channel = 0; channel < aChannelData.Length(); ++channel) {
+       chunk->mChannelData.AppendElement(aChannelData[channel]);
+     }
+     chunk->mVolume = 1.0f;
+     chunk->mBufferFormat = AUDIO_FORMAT_FLOAT32;
++#ifdef MOZILLA_INTERNAL_API
++    chunk->mTimeStamp = TimeStamp::Now();
++#endif
+   }
+   void AppendFrames(already_AddRefed<ThreadSharedObject> aBuffer,
+                     const nsTArray<const int16_t*>& aChannelData,
+                     int32_t aDuration)
+   {
+     AudioChunk* chunk = AppendChunk(aDuration);
+     chunk->mBuffer = aBuffer;
+     for (uint32_t channel = 0; channel < aChannelData.Length(); ++channel) {
+       chunk->mChannelData.AppendElement(aChannelData[channel]);
+     }
+     chunk->mVolume = 1.0f;
+     chunk->mBufferFormat = AUDIO_FORMAT_S16;
++#ifdef MOZILLA_INTERNAL_API
++    chunk->mTimeStamp = TimeStamp::Now();
++#endif
+   }
+   // Consumes aChunk, and returns a pointer to the persistent copy of aChunk
+   // in the segment.
+   AudioChunk* AppendAndConsumeChunk(AudioChunk* aChunk)
+   {
+     AudioChunk* chunk = AppendChunk(aChunk->mDuration);
+     chunk->mBuffer = aChunk->mBuffer.forget();
+     chunk->mChannelData.SwapElements(aChunk->mChannelData);
+     chunk->mVolume = aChunk->mVolume;
+     chunk->mBufferFormat = aChunk->mBufferFormat;
++#ifdef MOZILLA_INTERNAL_API
++    chunk->mTimeStamp = TimeStamp::Now();
++#endif
+     return chunk;
+   }
+   void ApplyVolume(float aVolume);
+   void WriteTo(AudioStream* aOutput);
+ 
+   static Type StaticType() { return AUDIO; }
+ };
+ 
+diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
+--- a/content/media/AudioStream.cpp
++++ b/content/media/AudioStream.cpp
+@@ -9,16 +9,17 @@
+ #include "prdtoa.h"
+ #include "AudioStream.h"
+ #include "nsAlgorithm.h"
+ #include "VideoUtils.h"
+ #include "mozilla/Monitor.h"
+ #include "mozilla/Mutex.h"
+ #include <algorithm>
+ #include "mozilla/Preferences.h"
++#include "Latency.h"
+ 
+ #if defined(MOZ_CUBEB)
+ #include "nsAutoRef.h"
+ #include "cubeb/cubeb.h"
+ 
+ template <>
+ class nsAutoRefTraits<cubeb_stream> : public nsPointerRefTraits<cubeb_stream>
+ {
+@@ -377,16 +378,18 @@ private:
+   double mVolume;
+ 
+   // Owning reference to a cubeb_stream.  cubeb_stream_destroy is called by
+   // nsAutoRef's destructor.
+   nsAutoRef<cubeb_stream> mCubebStream;
+ 
+   uint32_t mBytesPerFrame;
+ 
++  int32_t mLatency;
++
+   uint32_t BytesToFrames(uint32_t aBytes) {
+     NS_ASSERTION(aBytes % mBytesPerFrame == 0,
+                  "Byte count not aligned on frames size.");
+     return aBytes / mBytesPerFrame;
+   }
+ 
+   uint32_t FramesToBytes(uint32_t aFrames) {
+     return aFrames * mBytesPerFrame;
+@@ -499,24 +502,26 @@ WriteDumpFile(FILE* aDumpFile, AudioStre
+   fflush(aDumpFile);
+ }
+ 
+ #if defined(MOZ_CUBEB)
+ BufferedAudioStream::BufferedAudioStream()
+   : mMonitor("BufferedAudioStream"), mLostFrames(0), mDumpFile(nullptr),
+     mVolume(1.0), mBytesPerFrame(0), mState(INITIALIZED)
+ {
++  AsyncLatencyLogger::Get(true)->AddRef();
+ }
+ 
+ BufferedAudioStream::~BufferedAudioStream()
+ {
+   Shutdown();
+   if (mDumpFile) {
+     fclose(mDumpFile);
+   }
++  AsyncLatencyLogger::Get()->Release();
+ }
+ 
+ nsresult
+ BufferedAudioStream::EnsureTimeStretcherInitialized()
+ {
+   MonitorAutoLock mon(mMonitor);
+   return AudioStream::EnsureTimeStretcherInitialized();
+ }
+@@ -623,16 +628,17 @@ BufferedAudioStream::Write(const AudioDa
+           return NS_ERROR_FAILURE;
+         }
+       }
+       mon.Wait();
+     }
+   }
+ 
+   mWritten += aFrames;
++  mLatency += aFrames;
+ 
+   return NS_OK;
+ }
+ 
+ uint32_t
+ BufferedAudioStream::Available()
+ {
+   MonitorAutoLock mon(mMonitor);
+@@ -893,16 +899,25 @@ BufferedAudioStream::DataCallback(void* 
+              ("AudioStream %p lost %d frames", this, underrunFrames));
+     }
+ #endif
+     mLostFrames += underrunFrames;
+     servicedFrames += underrunFrames;
+   }
+ 
+   WriteDumpFile(mDumpFile, this, aFrames, aBuffer);
++  mLatency -= servicedFrames;
++  {
++    uint32_t latency = -1;
++    if (cubeb_stream_get_latency(mCubebStream, &latency)) {
++      NS_WARNING("Could not get latency from cubeb.");
++    }
++    LogLatency(AsyncLatencyLogger::AudioStream, static_cast<double>(mBuffer.Length()) / mOutRate * 1000.);
++    LogLatency(AsyncLatencyLogger::Cubeb, (double) static_cast<double>(latency) / mOutRate * 1000.);
++  }
+ 
+   mAudioClock.UpdateWritePosition(servicedFrames);
+   return servicedFrames;
+ }
+ 
+ void
+ BufferedAudioStream::StateCallback(cubeb_state aState)
+ {
+diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
+new file mode 100644
+--- /dev/null
++++ b/content/media/Latency.cpp
+@@ -0,0 +1,113 @@
++#include "Latency.h"
++#include "nsThreadUtils.h"
++#include <prlog.h>
++#include <cmath>
++#include <algorithm>
++
++using namespace mozilla;
++
++const char* LatencyLogIndex2Strings[] = {
++  "MediaStream",
++  "Cubeb",
++  "AudioStream",
++  "NetStat"
++};
++
++AsyncLatencyLogger* gAsyncLogger = nullptr;
++mozilla::Monitor* AsyncLatencyLogger::mMonitor = nullptr;
++
++class LogEvent : public nsRunnable
++{
++public:
++  LogEvent(AsyncLatencyLogger::LatencyLogIndex aIndex, double aValue) :
++    mIndex(aIndex),
++    mValue(aValue)
++  {}
++  ~LogEvent() {}
++
++  NS_IMETHOD Run() {
++    AsyncLatencyLogger::Get(true)->WriteLog(mIndex, mValue);
++    return NS_OK;
++  }
++
++protected:
++  AsyncLatencyLogger::LatencyLogIndex mIndex;
++  double mValue;
++};
++
++// This is the only function that clients should use.
++void LogLatency(AsyncLatencyLogger::LatencyLogIndex aIndex, double aValue)
++{
++  AsyncLatencyLogger::Get()->Log(aIndex, aValue);
++}
++
++void AsyncLatencyLogger::InitializeStatics()
++{
++  AsyncLatencyLogger::mMonitor = new Monitor("MediaLatencyLogMonitor");
++}
++
++void AsyncLatencyLogger::Shutdown()
++{
++  delete mMonitor;
++}
++
++AsyncLatencyLogger* AsyncLatencyLogger::Get(bool aStartTimer)
++{
++  if (!gAsyncLogger) {
++    MonitorAutoLock mon(*mMonitor);
++    if (!gAsyncLogger) {
++      gAsyncLogger = new AsyncLatencyLogger();
++    }
++  }
++  {
++    if (aStartTimer && gAsyncLogger->mStart.IsNull()) {
++      MonitorAutoLock mon(*mMonitor);
++      if (aStartTimer && gAsyncLogger->mStart.IsNull()) {
++        gAsyncLogger->Init();
++      }
++    }
++  }
++  return gAsyncLogger;
++}
++
++AsyncLatencyLogger::AsyncLatencyLogger()
++  : mThread(nullptr),
++    mMediaLatencyLog(nullptr)
++{ }
++
++AsyncLatencyLogger::~AsyncLatencyLogger()
++{
++  MonitorAutoLock mon(*mMonitor);
++  if (mThread) {
++    mThread->Shutdown();
++  }
++  mStart = TimeStamp();
++}
++
++void AsyncLatencyLogger::Init()
++{
++  mStart = TimeStamp::Now();
++  mMediaLatencyLog = PR_NewLogModule("MediaLatency");
++  nsresult rv = NS_NewNamedThread("Media Log", getter_AddRefs(mThread));
++  NS_ENSURE_SUCCESS(rv,);
++}
++
++void AsyncLatencyLogger::WriteLog(LatencyLogIndex aIndex, double aValue)
++{
++  PR_LOG(mMediaLatencyLog, PR_LOG_DEBUG, ("%s,%lf,%lf", LatencyLogIndex2Strings[aIndex], GetTimeStamp(), aValue));
++}
++
++double AsyncLatencyLogger::GetTimeStamp()
++{
++  TimeDuration t = TimeStamp::Now() - mStart;
++  return t.ToMilliseconds();
++}
++
++void AsyncLatencyLogger::Log(LatencyLogIndex aIndex, double aValue)
++{
++  nsCOMPtr<nsIRunnable> event = new LogEvent(aIndex, aValue);
++  if (mThread) {
++    mThread->Dispatch(event, NS_DISPATCH_NORMAL);
++  }
++}
++
+diff --git a/content/media/Latency.h b/content/media/Latency.h
+new file mode 100644
+--- /dev/null
++++ b/content/media/Latency.h
+@@ -0,0 +1,53 @@
++#ifndef MOZILLA_LATENCY_H
++#define MOZILLA_LATENCY_H
++
++#include "mozilla/TimeStamp.h"
++#include "prlog.h"
++#include "nsCOMPtr.h"
++#include "nsIThread.h"
++#include "mozilla/Monitor.h"
++#include "nsISupportsImpl.h"
++
++class AsyncLatencyLogger;
++class LogEvent;
++
++// This class is a singleton, and works only when there is only one active
++// stream. It is refcounted.
++class AsyncLatencyLogger
++{
++    NS_INLINE_DECL_THREADSAFE_REFCOUNTING(AsyncLatencyLogger);
++    public:
++      enum LatencyLogIndex {
++          MediaStream,
++          Cubeb,
++          AudioStream,
++          NetEQ,
++          _MAX_INDEX
++      };
++      void Log(LatencyLogIndex index, double value);
++      void WriteLog(LatencyLogIndex index, double value);
++
++      static AsyncLatencyLogger* Get(bool aStartTimer = false);
++      static void InitializeStatics();
++      static void Shutdown();
++    private:
++      AsyncLatencyLogger();
++      ~AsyncLatencyLogger();
++      double GetTimeStamp();
++      void Init();
++      // The thread on which the IO happens
++      nsCOMPtr<nsIThread> mThread;
++      // This can be initialized on multiple threads, but is protected by a
++      // monitor. After the initialization phase, it is accessed on the log
++      // thread only.
++      mozilla::TimeStamp mStart;
++      PRLogModuleInfo* mMediaLatencyLog;
++      // This monitor protects mStart and mMediaLatencyLog for the
++      // initialization sequence. It is initialized at layout startup, and
++      // destroyed at layout shutdown.
++      static mozilla::Monitor* mMonitor;
++};
++
++void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, double value);
++
++#endif
+diff --git a/content/media/Makefile.in b/content/media/Makefile.in
+--- a/content/media/Makefile.in
++++ b/content/media/Makefile.in
+@@ -24,10 +24,11 @@ LOCAL_INCLUDES  += \
+   $(NULL)
+ 
+ ifdef MOZ_DIRECTSHOW
+ LOCAL_INCLUDES += -I$(topsrcdir)/media/webrtc/trunk/webrtc/modules/video_capture/windows/
+ endif
+ 
+ CFLAGS   += $(GSTREAMER_CFLAGS)
+ CXXFLAGS += $(GSTREAMER_CFLAGS)
++DEFINES  += -DMOZILLA_INTERNAL_API
+ 
+ AudioNodeEngineNEON.$(OBJ_SUFFIX): CXXFLAGS += -mfpu=neon
+diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
+--- a/content/media/MediaSegment.h
++++ b/content/media/MediaSegment.h
+@@ -2,17 +2,21 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef MOZILLA_MEDIASEGMENT_H_
+ #define MOZILLA_MEDIASEGMENT_H_
+ 
+ #include "nsTArray.h"
++#ifdef MOZILLA_INTERNAL_API
++#include "mozilla/TimeStamp.h"
++#endif
+ #include <algorithm>
++#include "Latency.h"
+ 
+ namespace mozilla {
+ 
+ /**
+  * We represent media times in 64-bit fixed point. So 1 MediaTime is
+  * 1/(2^MEDIA_TIME_FRAC_BITS) seconds.
+  */
+ typedef int64_t MediaTime;
+@@ -171,16 +175,19 @@ public:
+     if (aDuration <= 0) {
+       return;
+     }
+     if (!mChunks.IsEmpty() && mChunks[0].IsNull()) {
+       mChunks[0].mDuration += aDuration;
+     } else {
+       mChunks.InsertElementAt(0)->SetNull(aDuration);
+     }
++#ifdef MOZILLA_INTERNAL_API
++    mChunks[0].mTimeStamp = mozilla::TimeStamp::Now();
++#endif
+     mDuration += aDuration;
+   }
+   virtual void AppendNullData(TrackTicks aDuration)
+   {
+     if (aDuration <= 0) {
+       return;
+     }
+     if (!mChunks.IsEmpty() && mChunks[mChunks.Length() - 1].IsNull()) {
+@@ -304,13 +311,16 @@ protected:
+       t -= c->GetDuration();
+       chunksToRemove = i + 1 - aStartIndex;
+     }
+     mChunks.RemoveElementsAt(aStartIndex, chunksToRemove);
+     mDuration -= aDuration - t;
+   }
+ 
+   nsTArray<Chunk> mChunks;
++#ifdef MOZILLA_INTERNAL_API
++  mozilla::TimeStamp mTimeStamp;
++#endif
+ };
+ 
+ }
+ 
+ #endif /* MOZILLA_MEDIASEGMENT_H_ */
+diff --git a/content/media/VideoSegment.h b/content/media/VideoSegment.h
+--- a/content/media/VideoSegment.h
++++ b/content/media/VideoSegment.h
+@@ -67,21 +67,23 @@ struct VideoChunk {
+   {
+     return aOther.mFrame == mFrame;
+   }
+   bool IsNull() const { return !mFrame.GetImage(); }
+   void SetNull(TrackTicks aDuration)
+   {
+     mDuration = aDuration;
+     mFrame.SetNull();
++    mTimeStamp = TimeStamp();
+   }
+   void SetForceBlack(bool aForceBlack) { mFrame.SetForceBlack(aForceBlack); }
+ 
+   TrackTicks mDuration;
+   VideoFrame mFrame;
++  mozilla::TimeStamp mTimeStamp;
+ };
+ 
+ class VideoSegment : public MediaSegmentBase<VideoSegment, VideoChunk> {
+ public:
+   typedef mozilla::layers::Image Image;
+ 
+   VideoSegment();
+   ~VideoSegment();
+diff --git a/content/media/moz.build b/content/media/moz.build
+--- a/content/media/moz.build
++++ b/content/media/moz.build
+@@ -61,16 +61,17 @@ EXPORTS += [
+     'AudioSampleFormat.h',
+     'AudioSegment.h',
+     'AudioStream.h',
+     'BufferMediaResource.h',
+     'DOMMediaStream.h',
+     'DecoderTraits.h',
+     'EncodedBufferCache.h',
+     'FileBlockCache.h',
++    'Latency.h',
+     'MediaCache.h',
+     'MediaDecoder.h',
+     'MediaDecoderOwner.h',
+     'MediaDecoderReader.h',
+     'MediaDecoderStateMachine.h',
+     'MediaMetadataManager.h',
+     'MediaRecorder.h',
+     'MediaResource.h',
+@@ -105,16 +106,17 @@ CPP_SOURCES += [
+     'AudioNodeStream.cpp',
+     'AudioSegment.cpp',
+     'AudioStream.cpp',
+     'AudioStreamTrack.cpp',
+     'DOMMediaStream.cpp',
+     'DecoderTraits.cpp',
+     'EncodedBufferCache.cpp',
+     'FileBlockCache.cpp',
++    'Latency.cpp',
+     'MediaCache.cpp',
+     'MediaDecoder.cpp',
+     'MediaDecoderReader.cpp',
+     'MediaDecoderStateMachine.cpp',
+     'MediaRecorder.cpp',
+     'MediaResource.cpp',
+     'MediaStreamGraph.cpp',
+     'MediaStreamTrack.cpp',
+diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/MediaEngineWebRTC.h
+--- a/content/media/webrtc/MediaEngineWebRTC.h
++++ b/content/media/webrtc/MediaEngineWebRTC.h
+@@ -352,30 +352,36 @@ public:
+     , mVoiceEngine(nullptr)
+     , mVideoEngineInit(false)
+     , mAudioEngineInit(false)
+     , mCameraManager(aCameraManager)
+     , mWindowId(aWindowId)
+   {
+ 	mVideoSources.Init();
+ 	mAudioSources.Init();
++        AsyncLatencyLogger::Get(true)->AddRef();
+   }
+ #else
+   MediaEngineWebRTC()
+     : mMutex("mozilla::MediaEngineWebRTC")
+     , mVideoEngine(nullptr)
+     , mVoiceEngine(nullptr)
+     , mVideoEngineInit(false)
+     , mAudioEngineInit(false)
+   {
+     mVideoSources.Init();
+     mAudioSources.Init();
+   }
+ #endif
+-  ~MediaEngineWebRTC() { Shutdown(); }
++  ~MediaEngineWebRTC() {
++    Shutdown();
++#ifdef MOZ_B2G_CAMERA
++    AsyncLatencyLogger::Get()->Release();
++#endif
++  }
+ 
+   // Clients should ensure to clean-up sources video/audio sources
+   // before invoking Shutdown on this class.
+   void Shutdown();
+ 
+   virtual void EnumerateVideoDevices(nsTArray<nsRefPtr<MediaEngineVideoSource> >*);
+   virtual void EnumerateAudioDevices(nsTArray<nsRefPtr<MediaEngineAudioSource> >*);
+ 
+diff --git a/content/media/webrtc/MediaEngineWebRTCAudio.cpp b/content/media/webrtc/MediaEngineWebRTCAudio.cpp
+--- a/content/media/webrtc/MediaEngineWebRTCAudio.cpp
++++ b/content/media/webrtc/MediaEngineWebRTCAudio.cpp
+@@ -1,13 +1,14 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "MediaEngineWebRTC.h"
++#include "Latency.h"
+ 
+ #define CHANNELS 1
+ #define ENCODING "L16"
+ #define DEFAULT_PORT 5555
+ 
+ #define SAMPLE_RATE 256000
+ #define SAMPLE_FREQUENCY 16000
+ #define SAMPLE_LENGTH ((SAMPLE_FREQUENCY*10)/1000)
+diff --git a/graph.py b/graph.py
+new file mode 100644
+--- /dev/null
++++ b/graph.py
+@@ -0,0 +1,88 @@
++#!/usr/bin/python
++
++# needs matplotlib (sudo aptitude install python-matplotlib)
++
++import matplotlib.pyplot as plt
++from matplotlib import rc
++import sys
++from pprint import pprint
++
++def compute_sum(data):
++    'Compute the sum for each timestamp. This expects the output of parse_data.'
++    last_values = {}
++    out = ([],[])
++
++    for i in data:
++        if i[0] not in last_values.keys():
++          last_values[i[0]] = 0
++        last_values[i[0]] = float(i[2])
++        print last_values
++        out[0].append(i[1])
++        out[1].append(sum(last_values.values()))
++    return out
++
++
++def clean_data(raw_data):
++    '''
++    Remove the PR_LOG cruft at the beginning of each line and returns a list of
++    tuple.
++    '''
++    out = []
++    for line in raw_data:
++        out.append(line.split(": ")[1])
++    return out
++
++# returns a list of tuples
++def parse_data(raw_lines):
++    '''
++    Split each line by , and put every bit in a tuple.
++    '''
++    out = []
++    for line in raw_lines:
++        out.append(line.split(','))
++    return out
++
++if len(sys.argv) == 3:
++    name = sys.argv[1]
++    channels = int(sys.argv[2])
++else:
++    print sys.argv[0] + "latency_log"
++
++try:
++    f = open(sys.argv[1])
++except:
++    print "cannot open " + name
++
++raw_lines = f.readlines()
++lines = clean_data(raw_lines)
++data = parse_data(lines)
++
++final_data = {}
++
++for tupl in data:
++    if tupl[0] not in final_data.keys():
++        final_data[tupl[0]] = ([], [])
++
++    final_data[tupl[0]][0].append(float(tupl[1]))
++    final_data[tupl[0]][1].append(float(tupl[2]))
++
++overall = compute_sum(data)
++
++
++final_data["overall"] = overall
++pprint(final_data)
++
++fig = plt.figure()
++for i in final_data.keys():
++    plt.plot(final_data[i][0], final_data[i][1], label=i)
++
++plt.legend()
++plt.suptitle("Latency in ms (y-axis) against time in ms (x-axis).")
++
++size = fig.get_size_inches()
++# make it gigantic so we can see things. sometimes, if the graph is too big,
++# this errors. reduce the factor so it stays under 2**15.
++fig.set_size_inches((size[0]*10, size[1]*2))
++name = sys.argv[1][:-4] + ".pdf"
++fig.savefig(name)
++
+diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
+--- a/layout/build/nsLayoutStatics.cpp
++++ b/layout/build/nsLayoutStatics.cpp
+@@ -88,16 +88,17 @@
+ #endif
+ 
+ #ifdef MOZ_GSTREAMER
+ #include "GStreamerFormatHelper.h"
+ #endif
+ 
+ #include "AudioStream.h"
+ #include "WebAudioUtils.h"
++#include "Latency.h"
+ 
+ #ifdef MOZ_WIDGET_GONK
+ #include "nsVolumeService.h"
+ using namespace mozilla::system;
+ #endif
+ 
+ #include "nsError.h"
+ 
+@@ -245,16 +246,17 @@ nsLayoutStatics::Initialize()
+ 
+   rv = nsFocusManager::Init();
+   if (NS_FAILED(rv)) {
+     NS_ERROR("Could not initialize nsFocusManager");
+     return rv;
+   }
+ 
+   AudioStream::InitLibrary();
++  AsyncLatencyLogger::InitializeStatics();
+ 
+   nsContentSink::InitializeStatics();
+   nsHtml5Module::InitializeStatics();
+   nsLayoutUtils::Initialize();
+   nsIPresShell::InitializeStatics();
+   nsRefreshDriver::InitializeStatics();
+ 
+   nsCORSListenerProxy::Startup();
+@@ -350,16 +352,17 @@ nsLayoutStatics::Shutdown()
+ #endif
+ 
+ #ifdef MOZ_GSTREAMER
+   GStreamerFormatHelper::Shutdown();
+ #endif
+ 
+   AudioStream::ShutdownLibrary();
+   WebAudioUtils::Shutdown();
++  AsyncLatencyLogger::Shutdown();
+ 
+ #ifdef MOZ_WMF
+   WMFDecoder::UnloadDLLs();
+ #endif
+ 
+ #ifdef MOZ_WIDGET_GONK
+   nsVolumeService::Shutdown();
+ #endif

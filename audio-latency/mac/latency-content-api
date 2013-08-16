@@ -1,0 +1,342 @@
+# HG changeset patch
+# Parent 0316204680ba6ff4f8c92c86bfd221aaa3457272
+# User Paul Adenot <paul@paul.cx>
+Bug 904617 Add a content API to set the requested latency
+
+diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
+--- a/content/media/AudioStream.cpp
++++ b/content/media/AudioStream.cpp
+@@ -89,18 +89,19 @@ static cubeb* GetCubebContext()
+     return gCubebContext;
+   }
+   NS_WARNING("cubeb_init failed");
+   return nullptr;
+ }
+ 
+ static uint32_t GetCubebLatency()
+ {
+-  MutexAutoLock lock(*gAudioPrefsLock);
+-  return gCubebLatency;
++  return static_cast<uint32_t>(AsyncLatencyLogger::Get()->GetRequestedLatency());
++  //MutexAutoLock lock(*gAudioPrefsLock);
++  //return gCubebLatency;
+ }
+ #endif
+ 
+ #if defined(MOZ_CUBEB) && defined(__ANDROID__) && defined(MOZ_B2G)
+ static cubeb_stream_type ConvertChannelToCubebType(dom::AudioChannelType aType)
+ {
+   switch(aType) {
+     case dom::AUDIO_CHANNEL_NORMAL:
+@@ -916,17 +917,19 @@ BufferedAudioStream::DataCallback(void* 
+   WriteDumpFile(mDumpFile, this, aFrames, aBuffer);
+   mLatency -= servicedFrames;
+   {
+     uint32_t latency = -1;
+     if (cubeb_stream_get_latency(mCubebStream, &latency)) {
+       NS_WARNING("Could not get latency from cubeb.");
+     }
+     LogLatency(AsyncLatencyLogger::AudioStream, static_cast<double>(mBuffer.Length()) / mOutRate * 1000.);
+-    LogLatency(AsyncLatencyLogger::Cubeb, (double) static_cast<double>(latency) / mOutRate * 1000.);
++    double latency_ms = (double) static_cast<double>(latency) / mOutRate * 1000.;
++    LogLatency(AsyncLatencyLogger::Cubeb, latency_ms);
++    AsyncLatencyLogger::Get()->SetActualLatency(latency_ms);
+   }
+ 
+   mAudioClock.UpdateWritePosition(servicedFrames);
+   return servicedFrames;
+ }
+ 
+ void
+ BufferedAudioStream::StateCallback(cubeb_state aState)
+diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
+--- a/content/media/Latency.cpp
++++ b/content/media/Latency.cpp
+@@ -1,14 +1,35 @@
+ #include "Latency.h"
+ #include "nsThreadUtils.h"
+ #include <prlog.h>
+ #include <cmath>
+ #include <algorithm>
+ 
++// latency targets, in ms, per platform
++#ifdef XP_WIN
++  // Windows: cubeb uses winmm, we can't do much here.
++  #define DEFAULT_LATENCY_TARGET 100
++#elif defined(XP_UNIX)
++  #if defined(XP_MACOSX)
++    // This works locally, need to test on more OSX devices.
++    #define DEFAULT_LATENCY_TARGET 20
++  #else
++    #ifndef ANDROID
++      // Linux desktop: we should be able to target 40ms latency using either alsa or pulse
++      #define DEFAULT_LATENCY_TARGET 40
++    #else
++      // Android, B2G TODO: handle fast-mixer enabled devices here, we might be
++      // able to reach the 10ms range on some device that can run fennec. The
++      // other devices and b2g have terrible backends.
++      #define DEFAULT_LATENCY_TARGET 100
++    #endif
++  #endif
++#endif
++
+ using namespace mozilla;
+ 
+ const char* LatencyLogIndex2Strings[] = {
+   "MediaStream",
+   "Cubeb",
+   "AudioStream",
+   "NetStat",
+   "AudioBufferSourceNode"
+@@ -84,17 +105,19 @@ AsyncLatencyLogger* AsyncLatencyLogger::
+       }
+     }
+   }
+   return gAsyncLogger;
+ }
+ 
+ AsyncLatencyLogger::AsyncLatencyLogger()
+   : mThread(nullptr),
+-    mMediaLatencyLog(nullptr)
++    mMediaLatencyLog(nullptr),
++    mRequestedLatency(DEFAULT_LATENCY_TARGET),
++    mActualLatency(0.0)
+ { }
+ 
+ AsyncLatencyLogger::~AsyncLatencyLogger()
+ {
+   MonitorAutoLock mon(*mMonitor);
+   if (mThread) {
+     mThread->Shutdown();
+   }
+@@ -136,8 +159,36 @@ void AsyncLatencyLogger::Log(LatencyLogI
+ void AsyncLatencyLogger::Log(LatencyLogIndex aIndex, const char* aValue)
+ {
+   nsCOMPtr<nsIRunnable> event = new LogEvent(aIndex, aValue);
+   if (mThread) {
+     mThread->Dispatch(event, NS_DISPATCH_NORMAL);
+   }
+ }
+ 
++nsresult AsyncLatencyLogger::SetRequestedLatency(double aRequestedLatency)
++{
++  MonitorAutoLock mon(*mMonitor);
++  // less than 1ms is not going to be achieved by anybody in userspace anyways.
++  if (aRequestedLatency < 1) {
++    return NS_ERROR_FAILURE;
++  }
++  mRequestedLatency = aRequestedLatency;
++  return NS_OK;
++}
++
++double AsyncLatencyLogger::GetRequestedLatency()
++{
++  MonitorAutoLock mon(*mMonitor);
++  return mRequestedLatency;
++}
++
++double AsyncLatencyLogger::GetActualLatency()
++{
++  MonitorAutoLock mon(*mMonitor);
++  return mActualLatency;
++}
++
++void AsyncLatencyLogger::SetActualLatency(double aLatency)
++{
++  MonitorAutoLock mon(*mMonitor);
++  mActualLatency = aLatency;
++}
+diff --git a/content/media/Latency.h b/content/media/Latency.h
+--- a/content/media/Latency.h
++++ b/content/media/Latency.h
+@@ -25,16 +25,21 @@ class AsyncLatencyLogger
+           AudioBufferSourceNode,
+           _MAX_INDEX
+       };
+       void Log(LatencyLogIndex index, double value);
+       void Log(LatencyLogIndex index, const char* msg);
+       void WriteLog(LatencyLogIndex index, double value);
+       void WriteLog(LatencyLogIndex index, const char* value);
+ 
++      nsresult SetRequestedLatency(double aLatency);
++      double GetRequestedLatency();
++      double GetActualLatency();
++      void SetActualLatency(double aLatency);
++
+       static AsyncLatencyLogger* Get(bool aStartTimer = false);
+       static void InitializeStatics();
+       static void Shutdown();
+     private:
+       AsyncLatencyLogger();
+       ~AsyncLatencyLogger();
+       double GetTimeStamp();
+       void Init();
+@@ -44,14 +49,16 @@ class AsyncLatencyLogger
+       // monitor. After the initialization phase, it is accessed on the log
+       // thread only.
+       mozilla::TimeStamp mStart;
+       PRLogModuleInfo* mMediaLatencyLog;
+       // This monitor protects mStart and mMediaLatencyLog for the
+       // initialization sequence. It is initialized at layout startup, and
+       // destroyed at layout shutdown.
+       static mozilla::Monitor* mMonitor;
++      double mRequestedLatency;
++      double mActualLatency;
+ };
+ 
+ void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, double value);
+ void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, char const* msg);
+ 
+ #endif
+diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
+--- a/dom/base/Navigator.cpp
++++ b/dom/base/Navigator.cpp
+@@ -470,16 +470,34 @@ Navigator::GetPlugins(ErrorResult& aRv)
+     nsWeakPtr win = do_GetWeakReference(mWindow);
+     mPlugins = new nsPluginArray(win);
+     mPlugins->Init();
+   }
+ 
+   return mPlugins;
+ }
+ 
++void
++Navigator::SetMozRequestedLatency(double aLatency, ErrorResult& aRv)
++{
++  aRv = AsyncLatencyLogger::Get()->SetRequestedLatency(aLatency);
++}
++
++double
++Navigator::GetMozRequestedLatency(ErrorResult& aRv)
++{
++  return AsyncLatencyLogger::Get()->GetRequestedLatency();
++}
++
++double
++Navigator::GetMozActualLatency(ErrorResult& aRv)
++{
++  return AsyncLatencyLogger::Get()->GetActualLatency();
++}
++
+ // Values for the network.cookie.cookieBehavior pref are documented in
+ // nsCookieService.cpp.
+ #define COOKIE_BEHAVIOR_REJECT 2
+ 
+ bool
+ Navigator::CookieEnabled()
+ {
+   bool cookieEnabled =
+diff --git a/dom/base/Navigator.h b/dom/base/Navigator.h
+--- a/dom/base/Navigator.h
++++ b/dom/base/Navigator.h
+@@ -166,16 +166,22 @@ public:
+   // The XPCOM GetLanguage is OK
+   bool OnLine();
+   void RegisterProtocolHandler(const nsAString& aScheme, const nsAString& aURL,
+                                const nsAString& aTitle, ErrorResult& aRv);
+   void RegisterContentHandler(const nsAString& aMIMEType, const nsAString& aURL,
+                               const nsAString& aTitle, ErrorResult& aRv);
+   nsMimeTypeArray* GetMimeTypes(ErrorResult& aRv);
+   nsPluginArray* GetPlugins(ErrorResult& aRv);
++  
++  //WebIDL Latency APIs
++  void SetMozRequestedLatency(double aLatency, ErrorResult& aRv);
++  double GetMozRequestedLatency(ErrorResult& aRv);
++  double GetMozActualLatency(ErrorResult& aRv);
++
+   // The XPCOM GetDoNotTrack is ok
+   Geolocation* GetGeolocation(ErrorResult& aRv);
+   battery::BatteryManager* GetBattery(ErrorResult& aRv);
+   void Vibrate(uint32_t aDuration, ErrorResult& aRv);
+   void Vibrate(const nsTArray<uint32_t>& aDuration, ErrorResult& aRv);
+   void GetAppCodeName(nsString& aAppCodeName, ErrorResult& aRv)
+   {
+     aRv = GetAppCodeName(aAppCodeName);
+diff --git a/dom/webidl/Navigator.webidl b/dom/webidl/Navigator.webidl
+--- a/dom/webidl/Navigator.webidl
++++ b/dom/webidl/Navigator.webidl
+@@ -145,16 +145,20 @@ partial interface Navigator {
+   // WebKit/Blink supports this (hardcoded "20030107"); Trident/Presto don't
+   readonly attribute DOMString productSub;
+   // WebKit/Blink/Trident/Presto support this.
+   readonly attribute boolean cookieEnabled;
+   [Throws]
+   readonly attribute DOMString buildID;
+   [Throws, Func="Navigator::HasPowerSupport"]
+   readonly attribute MozPowerManager mozPower;
++  [Throws]
++  attribute double mozRequestedLatency;
++  [Throws]
++  readonly  attribute double mozActualLatency;
+ 
+   // WebKit/Blink/Trident/Presto support this.
+   [Throws]
+   boolean javaEnabled();
+   // Everyone but WebKit/Blink supports this.  See bug 679971.
+   boolean taintEnabled();
+ 
+   /**
+diff --git a/graph.py b/graph.py
+--- a/graph.py
++++ b/graph.py
+@@ -1,16 +1,17 @@
+ #!/usr/bin/python
+ 
+ # needs matplotlib (sudo aptitude install python-matplotlib)
+ 
+ import matplotlib.pyplot as plt
+ from matplotlib import rc
+ import sys
+ from pprint import pprint
++import re
+ 
+ def compute_sum(data):
+     'Compute the sum for each timestamp. This expects the output of parse_data.'
+     last_values = {}
+     out = ([],[])
+ 
+     for i in data:
+         if i[0] not in last_values.keys():
+@@ -20,20 +21,22 @@ def compute_sum(data):
+         out[0].append(i[1])
+         out[1].append(sum(last_values.values()))
+     return out
+ 
+ 
+ def clean_data(raw_data):
+     '''
+     Remove the PR_LOG cruft at the beginning of each line and returns a list of
+-    tuple.
++    tuple. And ignore lines beginning by #
+     '''
+     out = []
+     for line in raw_data:
++      match = re.match(r'(.*) #(.*)', line);
++      if !match:
+         out.append(line.split(": ")[1])
+     return out
+ 
+ # returns a list of tuples
+ def parse_data(raw_lines):
+     '''
+     Split each line by , and put every bit in a tuple.
+     '''
+diff --git a/media/libcubeb/src/cubeb_wasapi.cpp b/media/libcubeb/src/cubeb_wasapi.cpp
+--- a/media/libcubeb/src/cubeb_wasapi.cpp
++++ b/media/libcubeb/src/cubeb_wasapi.cpp
+@@ -873,13 +873,13 @@ cubeb_ops const wasapi_ops = {
+   /*.init =*/ wasapi_init,
+   /*.get_backend_id =*/ wasapi_get_backend_id,
+   /*.get_max_channel_count*/ wasapi_get_max_channel_count,
+   /*.destroy =*/ wasapi_destroy,
+   /*.stream_init =*/ wasapi_stream_init,
+   /*.stream_destroy =*/ wasapi_stream_destroy,
+   /*.stream_start =*/ wasapi_stream_start,
+   /*.stream_stop =*/ wasapi_stream_stop,
+-  /*.stream_get_position =*/ wasapi_stream_get_position
+-  ///*.stream_get_latency =*/ wasapi_stream_get_latency
++  /*.stream_get_position =*/ wasapi_stream_get_position,
++  /*.stream_get_latency =*/ wasapi_stream_get_latency
+  };
+ } // namespace anonymous
+ 

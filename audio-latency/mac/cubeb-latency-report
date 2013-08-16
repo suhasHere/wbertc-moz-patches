@@ -1,0 +1,638 @@
+# HG changeset patch
+# Parent 95df3ec3bb70fe564900e9fa32745084a6cd9e03
+# User Paul Adenot <paul@paul.cx>
+Bug 904617 - Add a way to get cube latency
+
+diff --git a/layout/media/symbols.def.in b/layout/media/symbols.def.in
+--- a/layout/media/symbols.def.in
++++ b/layout/media/symbols.def.in
+@@ -115,16 +115,17 @@ speex_resampler_strerror
+ cubeb_destroy
+ cubeb_init
+ cubeb_get_max_channel_count
+ cubeb_stream_destroy
+ cubeb_stream_get_position
+ cubeb_stream_init
+ cubeb_stream_start
+ cubeb_stream_stop
++cubeb_stream_get_latency
+ #endif
+ #ifdef MOZ_OGG
+ th_comment_clear
+ th_comment_init
+ th_decode_alloc
+ th_decode_free
+ th_decode_headerin
+ th_decode_packetin
+diff --git a/media/libcubeb/include/cubeb.h b/media/libcubeb/include/cubeb.h
+--- a/media/libcubeb/include/cubeb.h
++++ b/media/libcubeb/include/cubeb.h
+@@ -229,13 +229,21 @@ int cubeb_stream_stop(cubeb_stream * str
+ 
+ /** Get the current stream playback position.
+     @param stream
+     @param position Playback position in frames.
+     @retval CUBEB_OK
+     @retval CUBEB_ERROR */
+ int cubeb_stream_get_position(cubeb_stream * stream, uint64_t * position);
+ 
++/** Get the latency for this stream, in frames. This is the number of frames
++    between the time cubeb acquires the data in the callback and the listener
++    can hear the sound.
++    @param stream
++    @retval CUBEB_OK
++    @retval CUBEBERROR */
++int cubeb_stream_get_latency(cubeb_stream * stream, uint32_t * latency);
++
+ #if defined(__cplusplus)
+ }
+ #endif
+ 
+ #endif /* CUBEB_c2f983e9_c96f_e71c_72c3_bbf62992a382 */
+diff --git a/media/libcubeb/src/cubeb-internal.h b/media/libcubeb/src/cubeb-internal.h
+--- a/media/libcubeb/src/cubeb-internal.h
++++ b/media/libcubeb/src/cubeb-internal.h
+@@ -18,11 +18,12 @@ struct cubeb_ops {
+                       cubeb_stream_params stream_params, unsigned int latency,
+                       cubeb_data_callback data_callback,
+                       cubeb_state_callback state_callback,
+                       void * user_ptr);
+   void (* stream_destroy)(cubeb_stream * stream);
+   int (* stream_start)(cubeb_stream * stream);
+   int (* stream_stop)(cubeb_stream * stream);
+   int (* stream_get_position)(cubeb_stream * stream, uint64_t * position);
++  int (* stream_get_latency)(cubeb_stream * stream, uint32_t * latency);
+ };
+ 
+ #endif /* CUBEB_INTERNAL_0eb56756_4e20_4404_a76d_42bf88cd15a5 */
+diff --git a/media/libcubeb/src/cubeb.c b/media/libcubeb/src/cubeb.c
+--- a/media/libcubeb/src/cubeb.c
++++ b/media/libcubeb/src/cubeb.c
+@@ -219,8 +219,18 @@ int
+ cubeb_stream_get_position(cubeb_stream * stream, uint64_t * position)
+ {
+   if (!stream || !position) {
+     return CUBEB_ERROR_INVALID_PARAMETER;
+   }
+ 
+   return stream->context->ops->stream_get_position(stream, position);
+ }
++
++int
++cubeb_stream_get_latency(cubeb_stream * stream, uint32_t * latency)
++{
++  if (!stream || !latency) {
++    return CUBEB_ERROR_INVALID_PARAMETER;
++  }
++
++  return stream->context->ops->stream_get_latency(stream, latency);
++}
+diff --git a/media/libcubeb/src/cubeb_alsa.c b/media/libcubeb/src/cubeb_alsa.c
+--- a/media/libcubeb/src/cubeb_alsa.c
++++ b/media/libcubeb/src/cubeb_alsa.c
+@@ -1004,19 +1004,35 @@ alsa_stream_get_position(cubeb_stream * 
+   }
+ 
+   stm->last_position = *position;
+ 
+   pthread_mutex_unlock(&stm->mutex);
+   return CUBEB_OK;
+ }
+ 
++int
++alsa_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
++{
++  snd_pcm_sframes_t delay;
++  // This function returns the delay in frames until a frame written using
++  // snd_pcm_writei is sent to the DAC. The DAC delay should be < 1ms anyways.
++  if (snd_pcm_delay(stm->pcm, &delay)) {
++    return CUBEB_ERROR;
++  }
++
++  *latency = delay;
++
++  return CUBEB_OK;
++}
++
+ static struct cubeb_ops const alsa_ops = {
+   .init = alsa_init,
+   .get_backend_id = alsa_get_backend_id,
+   .get_max_channel_count = alsa_get_max_channel_count,
+   .destroy = alsa_destroy,
+   .stream_init = alsa_stream_init,
+   .stream_destroy = alsa_stream_destroy,
+   .stream_start = alsa_stream_start,
+   .stream_stop = alsa_stream_stop,
+-  .stream_get_position = alsa_stream_get_position
++  .stream_get_position = alsa_stream_get_position,
++  .stream_get_latency = alsa_stream_get_latency
+ };
+diff --git a/media/libcubeb/src/cubeb_audiotrack.c b/media/libcubeb/src/cubeb_audiotrack.c
+--- a/media/libcubeb/src/cubeb_audiotrack.c
++++ b/media/libcubeb/src/cubeb_audiotrack.c
+@@ -1,16 +1,18 @@
+ /*
+  * Copyright © 2013 Mozilla Foundation
+  *
+  * This program is made available under an ISC-style license.  See the
+  * accompanying file LICENSE for details.
+  */
+ 
++#if !defined(NDEBUG)
+ #define NDEBUG
++#endif
+ #include <assert.h>
+ #include <pthread.h>
+ #include <stdlib.h>
+ #include <time.h>
+ #include <dlfcn.h>
+ #include "android/log.h"
+ 
+ #include "cubeb/cubeb.h"
+@@ -315,16 +317,17 @@ audiotrack_stream_init(cubeb * ctx, cube
+       stream_params.format == CUBEB_SAMPLE_FLOAT32BE) {
+     return CUBEB_ERROR_INVALID_FORMAT;
+   }
+ 
+   if (audiotrack_get_min_frame_count(ctx, &stream_params, &min_frame_count)) {
+     return CUBEB_ERROR;
+   }
+ 
++
+   stm = calloc(1, sizeof(*stm));
+   assert(stm);
+ 
+   stm->context = ctx;
+   stm->data_callback = data_callback;
+   stm->state_callback = state_callback;
+   stm->user_ptr = user_ptr;
+   stm->params = stream_params;
+@@ -419,19 +422,32 @@ audiotrack_stream_get_position(cubeb_str
+ 
+   assert(stream->instance && position);
+   stream->context->klass.get_position(stream->instance, &p);
+   *position = p;
+ 
+   return CUBEB_OK;
+ }
+ 
++int
++audiotrack_stream_get_latency(cubeb_stream * stream, uint32_t * latency)
++{
++  assert(stream->instance && latency);
++
++  /* Android returns the latency in ms, we want it in frames. */
++  *latency = stream->context->klass.latency(stream->instance);
++  *latency = (uint32_t)(*latency / 1000. * stream->params.rate);
++
++  return 0;
++}
++
+ static struct cubeb_ops const audiotrack_ops = {
+   .init = audiotrack_init,
+   .get_backend_id = audiotrack_get_backend_id,
+   .get_max_channel_count = audiotrack_get_max_channel_count,
+   .destroy = audiotrack_destroy,
+   .stream_init = audiotrack_stream_init,
+   .stream_destroy = audiotrack_stream_destroy,
+   .stream_start = audiotrack_stream_start,
+   .stream_stop = audiotrack_stream_stop,
+-  .stream_get_position = audiotrack_stream_get_position
++  .stream_get_position = audiotrack_stream_get_position,
++  .stream_get_latency = audiotrack_stream_get_latency
+ };
+diff --git a/media/libcubeb/src/cubeb_audiounit.c b/media/libcubeb/src/cubeb_audiounit.c
+--- a/media/libcubeb/src/cubeb_audiounit.c
++++ b/media/libcubeb/src/cubeb_audiounit.c
+@@ -5,41 +5,59 @@
+  * accompanying file LICENSE for details.
+  */
+ #undef NDEBUG
+ #include <assert.h>
+ #include <pthread.h>
+ #include <stdlib.h>
+ #include <AudioUnit/AudioUnit.h>
+ #include <CoreAudio/AudioHardware.h>
++#include <CoreAudio/HostTime.h>
+ #include "cubeb/cubeb.h"
+ #include "cubeb-internal.h"
+ 
+ #define NBUFS 4
+ 
+ static struct cubeb_ops const audiounit_ops;
+ 
+ struct cubeb {
+   struct cubeb_ops const * ops;
+ };
+ 
++#define S_PER_NS 1e-9
++
+ struct cubeb_stream {
+   cubeb * context;
+   AudioUnit unit;
+   cubeb_data_callback data_callback;
+   cubeb_state_callback state_callback;
+   void * user_ptr;
+   AudioStreamBasicDescription sample_spec;
+   pthread_mutex_t mutex;
+   uint64_t frames_played;
+   uint64_t frames_queued;
+   int shutdown;
+   int draining;
++  uint64_t current_latency_frames;
++  uint64_t hw_latency_frames;
+ };
+ 
++static int64_t
++audiotimestamp_to_latency(AudioTimeStamp const * tstamp, cubeb_stream * stream)
++{
++  if (!(tstamp->mFlags & kAudioTimeStampHostTimeValid)) {
++    return 0;
++  }
++
++  uint64_t pres = AudioConvertHostTimeToNanos(tstamp->mHostTime);
++  uint64_t now = AudioConvertHostTimeToNanos(AudioGetCurrentHostTime());
++
++  return (pres - now) * S_PER_NS * stream->sample_spec.mSampleRate;
++}
++
+ static OSStatus
+ audiounit_output_callback(void * user_ptr, AudioUnitRenderActionFlags * flags,
+                           AudioTimeStamp const * tstamp, UInt32 bus, UInt32 nframes,
+                           AudioBufferList * bufs)
+ {
+   cubeb_stream * stm;
+   unsigned char * buf;
+   long got;
+@@ -47,16 +65,18 @@ audiounit_output_callback(void * user_pt
+ 
+   assert(bufs->mNumberBuffers == 1);
+   buf = bufs->mBuffers[0].mData;
+ 
+   stm = user_ptr;
+ 
+   pthread_mutex_lock(&stm->mutex);
+ 
++  stm->current_latency_frames = audiotimestamp_to_latency(tstamp, stm);
++
+   if (stm->draining || stm->shutdown) {
+     pthread_mutex_unlock(&stm->mutex);
+     if (stm->draining) {
+       r = AudioOutputUnitStop(stm->unit);
+       assert(r == 0);
+       stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_DRAINED);
+     }
+     return noErr;
+@@ -250,16 +270,18 @@ audiounit_stream_init(cubeb * context, c
+ 
+   stm->sample_spec = ss;
+ 
+   r = pthread_mutex_init(&stm->mutex, NULL);
+   assert(r == 0);
+ 
+   stm->frames_played = 0;
+   stm->frames_queued = 0;
++  stm->current_latency_frames = 0;
++  stm->hw_latency_frames = -1;
+ 
+ #if MAC_OS_X_VERSION_MIN_REQUIRED < 1060
+   r = OpenAComponent(comp, &stm->unit);
+ #else
+   r = AudioComponentInstanceNew(comp, &stm->unit);
+ #endif
+   if (r != 0) {
+     audiounit_stream_destroy(stm);
+@@ -346,19 +368,104 @@ static int
+ audiounit_stream_get_position(cubeb_stream * stm, uint64_t * position)
+ {
+   pthread_mutex_lock(&stm->mutex);
+   *position = stm->frames_played;
+   pthread_mutex_unlock(&stm->mutex);
+   return CUBEB_OK;
+ }
+ 
++int
++audiounit_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
++{
++  if (stm->hw_latency_frames == (uint64_t)-1) {
++    UInt32 size;
++    uint32_t device_latency_frames, device_safety_offset;
++    double unit_latency_sec;
++    AudioDeviceID output_device_id;
++    OSStatus r;
++
++    AudioObjectPropertyAddress output_device_address = {
++      kAudioHardwarePropertyDefaultOutputDevice,
++      kAudioObjectPropertyScopeGlobal,
++      kAudioObjectPropertyElementMaster
++    };
++    AudioObjectPropertyAddress latency_address = {
++      kAudioDevicePropertyLatency,
++      kAudioDevicePropertyScopeOutput,
++      kAudioObjectPropertyElementMaster
++    };
++    AudioObjectPropertyAddress safety_offset_address = {
++      kAudioDevicePropertySafetyOffset,
++      kAudioDevicePropertyScopeOutput,
++      kAudioObjectPropertyElementMaster
++    };
++
++
++    size = sizeof(output_device_id);
++
++
++    r = AudioObjectGetPropertyData(kAudioObjectSystemObject,
++                                   &output_device_address,
++                                   0,
++                                   0,
++                                   &size,
++                                   &output_device_id);
++
++    size = sizeof(unit_latency_sec);
++    r = AudioUnitGetProperty(stm->unit,
++                             kAudioUnitProperty_Latency,
++                             kAudioUnitScope_Global,
++                             0,
++                             &unit_latency_sec,
++                             &size);
++    if (r != noErr) {
++      return CUBEB_ERROR;
++    }
++
++    size = sizeof(device_latency_frames);
++    r = AudioObjectGetPropertyData(output_device_id,
++                                   &latency_address,
++                                   0,
++                                   NULL,
++                                   &size,
++                                   &device_latency_frames);
++    if (r != noErr) {
++      return CUBEB_ERROR;
++    }
++
++    size = sizeof(device_safety_offset);
++    r = AudioObjectGetPropertyData(output_device_id,
++                                   &safety_offset_address,
++                                   0,
++                                   NULL,
++                                   &size,
++                                   &device_safety_offset);
++    if (r != noErr) {
++      return CUBEB_ERROR;
++    }
++
++    // This part is fixed and depend on the stream parameter and the hardware.
++    stm->hw_latency_frames =
++      (uint32_t)(unit_latency_sec * stm->sample_spec.mSampleRate)
++      + device_latency_frames
++      + device_safety_offset;
++  }
++
++  pthread_mutex_lock(&stm->mutex);
++  *latency = stm->hw_latency_frames + stm->current_latency_frames;
++  pthread_mutex_unlock(&stm->mutex);
++
++  return CUBEB_OK;
++}
++
+ static struct cubeb_ops const audiounit_ops = {
+   .init = audiounit_init,
+   .get_backend_id = audiounit_get_backend_id,
+   .get_max_channel_count = audiounit_get_max_channel_count,
+   .destroy = audiounit_destroy,
+   .stream_init = audiounit_stream_init,
+   .stream_destroy = audiounit_stream_destroy,
+   .stream_start = audiounit_stream_start,
+   .stream_stop = audiounit_stream_stop,
+-  .stream_get_position = audiounit_stream_get_position
++  .stream_get_position = audiounit_stream_get_position,
++  .stream_get_latency = audiounit_stream_get_latency
+ };
+diff --git a/media/libcubeb/src/cubeb_opensl.c b/media/libcubeb/src/cubeb_opensl.c
+--- a/media/libcubeb/src/cubeb_opensl.c
++++ b/media/libcubeb/src/cubeb_opensl.c
+@@ -408,19 +408,28 @@ opensl_stream_get_position(cubeb_stream 
+   SLmillisecond msec;
+   SLresult res = (*stm->play)->GetPosition(stm->play, &msec);
+   if (res != SL_RESULT_SUCCESS)
+     return CUBEB_ERROR;
+   *position = (stm->bytespersec / (1000 * stm->framesize)) * msec;
+   return CUBEB_OK;
+ }
+ 
++int
++opensl_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
++{
++  *latency = NBUFS * stm->queuebuf_len;
++
++  return CUBEB_OK;
++}
++
+ static struct cubeb_ops const opensl_ops = {
+   .init = opensl_init,
+   .get_backend_id = opensl_get_backend_id,
+   .get_max_channel_count = opensl_get_max_channel_count,
+   .destroy = opensl_destroy,
+   .stream_init = opensl_stream_init,
+   .stream_destroy = opensl_stream_destroy,
+   .stream_start = opensl_stream_start,
+   .stream_stop = opensl_stream_stop,
+-  .stream_get_position = opensl_stream_get_position
++  .stream_get_position = opensl_stream_get_position,
++  .stream_get_latency = opensl_stream_get_latency
+ };
+diff --git a/media/libcubeb/src/cubeb_pulse.c b/media/libcubeb/src/cubeb_pulse.c
+--- a/media/libcubeb/src/cubeb_pulse.c
++++ b/media/libcubeb/src/cubeb_pulse.c
+@@ -8,16 +8,18 @@
+ #include <assert.h>
+ #include <dlfcn.h>
+ #include <stdlib.h>
+ #include <pulse/pulseaudio.h>
+ #include <string.h>
+ #include "cubeb/cubeb.h"
+ #include "cubeb-internal.h"
+ 
++#define S_PER_USEC 1e-6
++
+ #ifdef DISABLE_LIBPULSE_DLOPEN
+ #define WRAP(x) x
+ #else
+ #define WRAP(x) cubeb_##x
+ #define MAKE_TYPEDEF(x) static typeof(x) * cubeb_##x
+ MAKE_TYPEDEF(pa_channel_map_init_auto);
+ MAKE_TYPEDEF(pa_context_connect);
+ MAKE_TYPEDEF(pa_context_disconnect);
+@@ -563,19 +565,42 @@ pulse_stream_get_position(cubeb_stream *
+   }
+ 
+   bytes = WRAP(pa_usec_to_bytes)(r_usec, &stm->sample_spec);
+   *position = bytes / WRAP(pa_frame_size)(&stm->sample_spec);
+ 
+   return CUBEB_OK;
+ }
+ 
++int
++pulse_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
++{
++  pa_usec_t r_usec;
++  int negative, r;
++
++  if (!stm) {
++    return CUBEB_ERROR;
++  }
++
++  r = WRAP(pa_stream_get_latency)(stm->stream, &r_usec, &negative);
++
++  assert(!negative);
++
++  if (r) {
++    return CUBEB_ERROR;
++  }
++
++  *latency = r_usec * S_PER_USEC * stm->sample_spec.rate;
++  return CUBEB_OK;
++}
++
+ static struct cubeb_ops const pulse_ops = {
+   .init = pulse_init,
+   .get_backend_id = pulse_get_backend_id,
+   .get_max_channel_count = pulse_get_max_channel_count,
+   .destroy = pulse_destroy,
+   .stream_init = pulse_stream_init,
+   .stream_destroy = pulse_stream_destroy,
+   .stream_start = pulse_stream_start,
+   .stream_stop = pulse_stream_stop,
+-  .stream_get_position = pulse_stream_get_position
++  .stream_get_position = pulse_stream_get_position,
++  .stream_get_latency = pulse_stream_get_latency
+ };
+diff --git a/media/libcubeb/src/cubeb_sndio.c b/media/libcubeb/src/cubeb_sndio.c
+--- a/media/libcubeb/src/cubeb_sndio.c
++++ b/media/libcubeb/src/cubeb_sndio.c
+@@ -309,18 +309,27 @@ sndio_stream_set_volume(cubeb_stream *s,
+ {
+   DPR("sndio_stream_set_volume(%f)\n", volume);
+   pthread_mutex_lock(&s->mtx);
+   sio_setvol(s->hdl, SIO_MAXVOL * volume);
+   pthread_mutex_unlock(&s->mtx);
+   return CUBEB_OK;
+ }
+ 
++int
++sndio_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
++{
++  // http://www.openbsd.org/cgi-bin/man.cgi?query=sio_open
++  // in the "Measuring the latency and buffers usage" paragraph.
++  return stm->wrpos - stm->rdpos;
++}
++
+ static struct cubeb_ops const sndio_ops = {
+   .init = sndio_init,
+   .get_backend_id = sndio_get_backend_id,
+   .destroy = sndio_destroy,
+   .stream_init = sndio_stream_init,
+   .stream_destroy = sndio_stream_destroy,
+   .stream_start = sndio_stream_start,
+   .stream_stop = sndio_stream_stop,
+-  .stream_get_position = sndio_stream_get_position
++  .stream_get_position = sndio_stream_get_position,
++  .stream_get_latency = sndio_stream_get_latency
+ };
+diff --git a/media/libcubeb/src/cubeb_winmm.c b/media/libcubeb/src/cubeb_winmm.c
+--- a/media/libcubeb/src/cubeb_winmm.c
++++ b/media/libcubeb/src/cubeb_winmm.c
+@@ -59,16 +59,17 @@ struct cubeb_stream {
+   size_t buffer_size;
+   int next_buffer;
+   int free_buffers;
+   int shutdown;
+   int draining;
+   HANDLE event;
+   HWAVEOUT waveout;
+   CRITICAL_SECTION lock;
++  int64_t written;
+ };
+ 
+ static size_t
+ bytes_per_frame(cubeb_stream_params params)
+ {
+   size_t bytes;
+ 
+   switch (params.format) {
+@@ -131,16 +132,17 @@ winmm_refill_stream(cubeb_stream * stm)
+ 
+   wanted = (DWORD) stm->buffer_size / bytes_per_frame(stm->params);
+ 
+   /* It is assumed that the caller is holding this lock.  It must be dropped
+      during the callback to avoid deadlocks. */
+   LeaveCriticalSection(&stm->lock);
+   got = stm->data_callback(stm, stm->user_ptr, hdr->lpData, wanted);
+   EnterCriticalSection(&stm->lock);
++  stm->written += got;
+   if (got < 0) {
+     LeaveCriticalSection(&stm->lock);
+     /* XXX handle this case */
+     assert(0);
+     return;
+   } else if (got < wanted) {
+     stm->draining = 1;
+   }
+@@ -384,16 +386,17 @@ winmm_stream_init(cubeb * context, cubeb
+ 
+   stm->context = context;
+ 
+   stm->params = stream_params;
+ 
+   stm->data_callback = data_callback;
+   stm->state_callback = state_callback;
+   stm->user_ptr = user_ptr;
++  stm->written = 0;
+ 
+   if (latency < context->minimum_latency) {
+     latency = context->minimum_latency;
+   }
+ 
+   bufsz = (size_t) (stm->params.rate / 1000.0 * latency * bytes_per_frame(stm->params) / NBUFS);
+   if (bufsz % bytes_per_frame(stm->params) != 0) {
+     bufsz += bytes_per_frame(stm->params) - (bufsz % bytes_per_frame(stm->params));
+@@ -569,19 +572,38 @@ winmm_stream_get_position(cubeb_stream *
+     return CUBEB_ERROR;
+   }
+ 
+   *position = time.u.sample;
+ 
+   return CUBEB_OK;
+ }
+ 
++int
++winmm_stream_get_latency(cubeb_stream * stm, uint32_t * latency)
++{
++  MMRESULT r;
++  MMTIME time;
++  uint64_t written;
++
++  EnterCriticalSection(&stm->lock);
++  time.wType = TIME_SAMPLES;
++  r = waveOutGetPosition(stm->waveout, &time, sizeof(time));
++  written = stm->written;
++  LeaveCriticalSection(&stm->lock);
++
++  *latency = written - time.u.sample;
++
++  return CUBEB_OK;
++}
++
+ static struct cubeb_ops const winmm_ops = {
+   /*.init =*/ winmm_init,
+   /*.get_backend_id =*/ winmm_get_backend_id,
+   /*.get_max_channel_count=*/ winmm_get_max_channel_count,
+   /*.destroy =*/ winmm_destroy,
+   /*.stream_init =*/ winmm_stream_init,
+   /*.stream_destroy =*/ winmm_stream_destroy,
+   /*.stream_start =*/ winmm_stream_start,
+   /*.stream_stop =*/ winmm_stream_stop,
+-  /*.stream_get_position =*/ winmm_stream_get_position
++  /*.stream_get_position =*/ winmm_stream_get_position,
++  /*.stream_get_latency = */ winmm_stream_get_latency
+ };
