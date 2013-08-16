@@ -1,0 +1,65 @@
+# HG changeset patch
+# Parent c7cc6c4cdc20dcc5b33fc5b1b1e2995d952cad18
+Bug 904617 - Fixes shutdown crashes
+
+diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
+--- a/content/media/Latency.cpp
++++ b/content/media/Latency.cpp
+@@ -116,17 +116,16 @@ AsyncLatencyLogger::AsyncLatencyLogger()
+ { }
+ 
+ AsyncLatencyLogger::~AsyncLatencyLogger()
+ {
+   MonitorAutoLock mon(*mMonitor);
+   if (mThread) {
+     mThread->Shutdown();
+   }
+-  gAsyncLogger = nullptr;
+   mStart = TimeStamp();
+ }
+ 
+ void AsyncLatencyLogger::Init()
+ {
+   mStart = TimeStamp::Now();
+   mMediaLatencyLog = PR_NewLogModule("MediaLatency");
+   nsresult rv = NS_NewNamedThread("Media Log", getter_AddRefs(mThread));
+diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/MediaEngineWebRTC.h
+--- a/content/media/webrtc/MediaEngineWebRTC.h
++++ b/content/media/webrtc/MediaEngineWebRTC.h
+@@ -352,33 +352,35 @@ public:
+     , mVoiceEngine(nullptr)
+     , mVideoEngineInit(false)
+     , mAudioEngineInit(false)
+     , mCameraManager(aCameraManager)
+     , mWindowId(aWindowId)
+   {
+ 	mVideoSources.Init();
+ 	mAudioSources.Init();
+-  AsyncLatencyLogger::Get(true)->AddRef();
++    AsyncLatencyLogger::Get(true)->AddRef();
+   }
+ #else
+   MediaEngineWebRTC()
+     : mMutex("mozilla::MediaEngineWebRTC")
+     , mVideoEngine(nullptr)
+     , mVoiceEngine(nullptr)
+     , mVideoEngineInit(false)
+     , mAudioEngineInit(false)
+   {
+     mVideoSources.Init();
+     mAudioSources.Init();
+   }
+ #endif
+   ~MediaEngineWebRTC() {
+     Shutdown();
++#ifdef MOZ_B2G_CAMERA      
+     AsyncLatencyLogger::Get()->Release();
++#endif
+   }
+ 
+   // Clients should ensure to clean-up sources video/audio sources
+   // before invoking Shutdown on this class.
+   void Shutdown();
+ 
+   virtual void EnumerateVideoDevices(nsTArray<nsRefPtr<MediaEngineVideoSource> >*);
+   virtual void EnumerateAudioDevices(nsTArray<nsRefPtr<MediaEngineAudioSource> >*);
