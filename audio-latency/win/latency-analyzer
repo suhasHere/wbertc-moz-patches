@@ -47,7 +47,7 @@ diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
 diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
 --- a/content/media/AudioSegment.h
 +++ b/content/media/AudioSegment.h
-@@ -5,16 +5,17 @@
+@@ -5,16 +5,19 @@
  
  #ifndef MOZILLA_AUDIOSEGMENT_H_
  #define MOZILLA_AUDIOSEGMENT_H_
@@ -56,7 +56,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
  #include "nsISupportsImpl.h"
  #include "AudioSampleFormat.h"
  #include "SharedBuffer.h"
++#ifdef MOZILLA_INTERNAL_API
 +#include "mozilla/TimeStamp.h"
++#endif 
  
  namespace mozilla {
  
@@ -65,7 +67,7 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
  /**
   * For auto-arrays etc, guess this as the common number of channels.
   */
-@@ -98,16 +99,17 @@ struct AudioChunk {
+@@ -98,16 +101,19 @@ struct AudioChunk {
      mVolume = 1.0f;
    }
  
@@ -74,7 +76,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
    nsTArray<const void*> mChannelData; // one pointer per channel; empty if and only if mBuffer is null
    float mVolume; // volume multiplier to apply (1.0f if mBuffer is nonnull)
    SampleFormat mBufferFormat; // format of frames in mBuffer (only meaningful if mBuffer is nonnull)
++#ifdef MOZILLA_INTERNAL_API
 +  mozilla::TimeStamp mTimeStamp;           // time at which this has been fetched from the MediaEngine
++#endif  
  };
  
  /**
@@ -83,7 +87,7 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
   */
  class AudioSegment : public MediaSegmentBase<AudioSegment, AudioChunk> {
  public:
-@@ -121,38 +123,41 @@ public:
+@@ -121,38 +127,47 @@ public:
    {
      AudioChunk* chunk = AppendChunk(aDuration);
      chunk->mBuffer = aBuffer;
@@ -92,7 +96,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
      }
      chunk->mVolume = 1.0f;
      chunk->mBufferFormat = AUDIO_FORMAT_FLOAT32;
++#ifdef MOZILLA_INTERNAL_API    
 +    chunk->mTimeStamp = TimeStamp::Now();
++#endif    
    }
    void AppendFrames(already_AddRefed<ThreadSharedObject> aBuffer,
                      const nsTArray<const int16_t*>& aChannelData,
@@ -105,7 +111,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
      }
      chunk->mVolume = 1.0f;
      chunk->mBufferFormat = AUDIO_FORMAT_S16;
++#ifdef MOZILLA_INTERNAL_API    
 +    chunk->mTimeStamp = TimeStamp::Now();
++#endif    
    }
    // Consumes aChunk, and returns a pointer to the persistent copy of aChunk
    // in the segment.
@@ -116,7 +124,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
      chunk->mChannelData.SwapElements(aChunk->mChannelData);
      chunk->mVolume = aChunk->mVolume;
      chunk->mBufferFormat = aChunk->mBufferFormat;
++#ifdef MOZILLA_INTERNAL_API    
 +    chunk->mTimeStamp = TimeStamp::Now();
++#endif    
      return chunk;
    }
    void ApplyVolume(float aVolume);
@@ -412,10 +422,25 @@ new file mode 100644
 +void LogLatency(AsyncLatencyLogger::LatencyLogIndex index, double value);
 +
 +#endif
+diff --git a/content/media/Makefile.in b/content/media/Makefile.in
+--- a/content/media/Makefile.in
++++ b/content/media/Makefile.in
+@@ -24,10 +24,11 @@ LOCAL_INCLUDES  += \
+   $(NULL)
+ 
+ ifdef MOZ_DIRECTSHOW
+ LOCAL_INCLUDES += -I$(topsrcdir)/media/webrtc/trunk/webrtc/modules/video_capture/windows/
+ endif
+ 
+ CFLAGS   += $(GSTREAMER_CFLAGS)
+ CXXFLAGS += $(GSTREAMER_CFLAGS)
++DEFINES  += -DMOZILLA_INTERNAL_API
+ 
+ AudioNodeEngineNEON.$(OBJ_SUFFIX): CXXFLAGS += -mfpu=neon
 diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
 --- a/content/media/MediaSegment.h
 +++ b/content/media/MediaSegment.h
-@@ -2,17 +2,19 @@
+@@ -2,17 +2,21 @@
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this file,
   * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -424,7 +449,9 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
  #define MOZILLA_MEDIASEGMENT_H_
  
  #include "nsTArray.h"
++#ifdef MOZILLA_INTERNAL_API
 +#include "mozilla/TimeStamp.h"
++#endif 
  #include <algorithm>
 +#include "Latency.h"
  
@@ -435,7 +462,7 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
   * 1/(2^MEDIA_TIME_FRAC_BITS) seconds.
   */
  typedef int64_t MediaTime;
-@@ -171,16 +173,17 @@ public:
+@@ -171,16 +175,19 @@ public:
      if (aDuration <= 0) {
        return;
      }
@@ -444,7 +471,9 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
      } else {
        mChunks.InsertElementAt(0)->SetNull(aDuration);
      }
++#ifdef MOZILLA_INTERNAL_API
 +    mChunks[0].mTimeStamp = mozilla::TimeStamp::Now();
++#endif    
      mDuration += aDuration;
    }
    virtual void AppendNullData(TrackTicks aDuration)
@@ -453,7 +482,7 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
        return;
      }
      if (!mChunks.IsEmpty() && mChunks[mChunks.Length() - 1].IsNull()) {
-@@ -304,13 +307,14 @@ protected:
+@@ -304,13 +311,16 @@ protected:
        t -= c->GetDuration();
        chunksToRemove = i + 1 - aStartIndex;
      }
@@ -462,7 +491,9 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
    }
  
    nsTArray<Chunk> mChunks;
++#ifdef MOZILLA_INTERNAL_API  
 +  mozilla::TimeStamp mTimeStamp;
++#endif  
  };
  
  }
@@ -597,7 +628,7 @@ diff --git a/graph.py b/graph.py
 new file mode 100644
 --- /dev/null
 +++ b/graph.py
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,94 @@
 +#!/usr/bin/python
 +
 +# needs matplotlib (sudo aptitude install python-matplotlib)
@@ -606,6 +637,8 @@ new file mode 100644
 +from matplotlib import rc
 +import sys
 +from pprint import pprint
++import re
++
 +
 +def compute_sum(data):
 +    'Compute the sum for each timestamp. This expects the output of parse_data.'
@@ -629,7 +662,11 @@ new file mode 100644
 +    '''
 +    out = []
 +    for line in raw_data:
-+        out.append(line.split(": ")[1])
++        match = re.match(r'(.*)#(.*)', line)
++        if match:
++	    continue
++	else:
++            out.append(line.split(": ")[1])
 +    return out
 +
 +# returns a list of tuples
@@ -743,24 +780,3 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  
  #ifdef MOZ_WIDGET_GONK
    nsVolumeService::Shutdown();
-diff --git a/media/webrtc/signaling/test/moz.build b/media/webrtc/signaling/test/moz.build
---- a/media/webrtc/signaling/test/moz.build
-+++ b/media/webrtc/signaling/test/moz.build
-@@ -3,13 +3,13 @@
- # This Source Code Form is subject to the terms of the Mozilla Public
- # License, v. 2.0. If a copy of the MPL was not distributed with this
- # file, You can obtain one at http://mozilla.org/MPL/2.0/.
- 
- MODULE = 'test_signaling'
- 
- if CONFIG['OS_TARGET'] != 'WINNT' and CONFIG['MOZ_WIDGET_TOOLKIT'] != 'gonk':
-     CPP_UNIT_TESTS += [
--        'mediaconduit_unittests.cpp',
--        'mediapipeline_unittest.cpp',
--        'sdp_unittests.cpp',
--        'signaling_unittests.cpp',
-+        #'mediaconduit_unittests.cpp',
-+        #'mediapipeline_unittest.cpp',
-+        #'sdp_unittests.cpp',
-+        #'signaling_unittests.cpp',
-     ]
