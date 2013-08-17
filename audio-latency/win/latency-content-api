@@ -3,6 +3,28 @@
 # User Paul Adenot <paul@paul.cx>
 Bug 904617 Add a content API to set the requested latency
 
+diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
+--- a/content/media/AudioSegment.cpp
++++ b/content/media/AudioSegment.cpp
+@@ -179,16 +179,17 @@ AudioSegment::WriteTo(AudioStream* aOutp
+                                      outputChannels,
+                                      buf.Elements());
+         }
+       } else {
+         // Assumes that a bit pattern of zeroes == 0.0f
+         memset(buf.Elements(), 0, buf.Length()*sizeof(AudioDataValue));
+       }
+       aOutput->Write(buf.Elements(), int32_t(duration));
+-      LogLatency(AsyncLatencyLogger::MediaStream, (mozilla::TimeStamp::Now() - c.mTimeStamp).ToMilliseconds());
++	  if(!c.mTimeStamp.IsNull())
++        LogLatency(AsyncLatencyLogger::MediaStream, (mozilla::TimeStamp::Now() - c.mTimeStamp).ToMilliseconds());
+       offset += duration;
+     }
+   }
+   aOutput->Start();
+ }
+ 
+ }
 diff --git a/content/media/AudioStream.cpp b/content/media/AudioStream.cpp
 --- a/content/media/AudioStream.cpp
 +++ b/content/media/AudioStream.cpp

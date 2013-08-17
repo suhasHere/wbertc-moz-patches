@@ -2,7 +2,7 @@
 # User Paul Adenot <paul@paul.cx>
 # Date 1359397357 -3600
 # Node ID 42d2048c3339a8943574998f515f004dd2b79852
-# Parent 1f5e05b70daa9d0827f6ee7e2de360e6402d80ee
+# Parent 51e39806d3659df520745ffcb6676a3213c464c1
 Bug 904617 - Log latency, and adds a python script to understand the log.
 
 diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
@@ -26,7 +26,7 @@ diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
  InterleaveAndConvertBuffer(const SrcT** aSourceChannels,
                             int32_t aLength, float aVolume,
                             int32_t aChannels,
-@@ -178,15 +179,16 @@ AudioSegment::WriteTo(AudioStream* aOutp
+@@ -178,15 +179,17 @@ AudioSegment::WriteTo(AudioStream* aOutp
                                       outputChannels,
                                       buf.Elements());
          }
@@ -35,7 +35,8 @@ diff --git a/content/media/AudioSegment.cpp b/content/media/AudioSegment.cpp
          memset(buf.Elements(), 0, buf.Length()*sizeof(AudioDataValue));
        }
        aOutput->Write(buf.Elements(), int32_t(duration));
-+      LogLatency(AsyncLatencyLogger::MediaStream, (mozilla::TimeStamp::Now() - c.mTimeStamp).ToMilliseconds());
++      if(!c.mTimeStamp.IsNull())
++        LogLatency(AsyncLatencyLogger::MediaStream, (mozilla::TimeStamp::Now() - c.mTimeStamp).ToMilliseconds());
        offset += duration;
      }
    }
@@ -239,7 +240,7 @@ diff --git a/content/media/Latency.cpp b/content/media/Latency.cpp
 new file mode 100644
 --- /dev/null
 +++ b/content/media/Latency.cpp
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,113 @@
 +#include "Latency.h"
 +#include "nsThreadUtils.h"
 +#include <prlog.h>
@@ -323,7 +324,6 @@ new file mode 100644
 +  if (mThread) {
 +    mThread->Shutdown();
 +  }
-+  gAsyncLogger = nullptr;
 +  mStart = TimeStamp();
 +}
 +
@@ -498,7 +498,7 @@ diff --git a/content/media/VideoSegment.h b/content/media/VideoSegment.h
 diff --git a/content/media/moz.build b/content/media/moz.build
 --- a/content/media/moz.build
 +++ b/content/media/moz.build
-@@ -58,16 +58,17 @@ EXPORTS += [
+@@ -61,16 +61,17 @@ EXPORTS += [
      'AudioSampleFormat.h',
      'AudioSegment.h',
      'AudioStream.h',
@@ -516,7 +516,7 @@ diff --git a/content/media/moz.build b/content/media/moz.build
      'MediaMetadataManager.h',
      'MediaRecorder.h',
      'MediaResource.h',
-@@ -102,16 +103,17 @@ CPP_SOURCES += [
+@@ -105,16 +106,17 @@ CPP_SOURCES += [
      'AudioNodeStream.cpp',
      'AudioSegment.cpp',
      'AudioStream.cpp',
@@ -537,7 +537,7 @@ diff --git a/content/media/moz.build b/content/media/moz.build
 diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/MediaEngineWebRTC.h
 --- a/content/media/webrtc/MediaEngineWebRTC.h
 +++ b/content/media/webrtc/MediaEngineWebRTC.h
-@@ -352,30 +352,34 @@ public:
+@@ -352,30 +352,36 @@ public:
      , mVoiceEngine(nullptr)
      , mVideoEngineInit(false)
      , mAudioEngineInit(false)
@@ -563,7 +563,9 @@ diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/Med
 -  ~MediaEngineWebRTC() { Shutdown(); }
 +  ~MediaEngineWebRTC() {
 +    Shutdown();
++#ifdef MOZ_B2G_CAMERA   
 +    AsyncLatencyLogger::Get()->Release();
++#endif   
 +  }
  
    // Clients should ensure to clean-up sources video/audio sources
@@ -697,6 +699,7 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  
  #include "AudioStream.h"
 +#include "Latency.h"
+ #include "WebAudioUtils.h"
  
  #ifdef MOZ_WIDGET_GONK
  #include "nsVolumeService.h"
@@ -704,8 +707,7 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  #endif
  
  #include "nsError.h"
- 
-@@ -244,16 +245,17 @@ nsLayoutStatics::Initialize()
+@@ -243,16 +244,17 @@ nsLayoutStatics::Initialize()
  
    rv = nsFocusManager::Init();
    if (NS_FAILED(rv)) {
@@ -723,7 +725,7 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
    nsRefreshDriver::InitializeStatics();
  
    nsCORSListenerProxy::Startup();
-@@ -348,16 +350,17 @@ nsLayoutStatics::Shutdown()
+@@ -347,16 +349,17 @@ nsLayoutStatics::Shutdown()
    MediaPluginHost::Shutdown();
  #endif
  
@@ -733,6 +735,7 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  
    AudioStream::ShutdownLibrary();
 +  AsyncLatencyLogger::Shutdown();
+   WebAudioUtils::Shutdown();
  
  #ifdef MOZ_WMF
    WMFDecoder::UnloadDLLs();
@@ -740,7 +743,6 @@ diff --git a/layout/build/nsLayoutStatics.cpp b/layout/build/nsLayoutStatics.cpp
  
  #ifdef MOZ_WIDGET_GONK
    nsVolumeService::Shutdown();
- #endif
 diff --git a/media/webrtc/signaling/test/moz.build b/media/webrtc/signaling/test/moz.build
 --- a/media/webrtc/signaling/test/moz.build
 +++ b/media/webrtc/signaling/test/moz.build
