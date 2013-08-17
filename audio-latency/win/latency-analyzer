@@ -58,7 +58,7 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
  #include "SharedBuffer.h"
 +#ifdef MOZILLA_INTERNAL_API
 +#include "mozilla/TimeStamp.h"
-+#endif 
++#endif
  
  namespace mozilla {
  
@@ -78,7 +78,7 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
    SampleFormat mBufferFormat; // format of frames in mBuffer (only meaningful if mBuffer is nonnull)
 +#ifdef MOZILLA_INTERNAL_API
 +  mozilla::TimeStamp mTimeStamp;           // time at which this has been fetched from the MediaEngine
-+#endif  
++#endif
  };
  
  /**
@@ -96,9 +96,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
      }
      chunk->mVolume = 1.0f;
      chunk->mBufferFormat = AUDIO_FORMAT_FLOAT32;
-+#ifdef MOZILLA_INTERNAL_API    
++#ifdef MOZILLA_INTERNAL_API
 +    chunk->mTimeStamp = TimeStamp::Now();
-+#endif    
++#endif
    }
    void AppendFrames(already_AddRefed<ThreadSharedObject> aBuffer,
                      const nsTArray<const int16_t*>& aChannelData,
@@ -111,9 +111,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
      }
      chunk->mVolume = 1.0f;
      chunk->mBufferFormat = AUDIO_FORMAT_S16;
-+#ifdef MOZILLA_INTERNAL_API    
++#ifdef MOZILLA_INTERNAL_API
 +    chunk->mTimeStamp = TimeStamp::Now();
-+#endif    
++#endif
    }
    // Consumes aChunk, and returns a pointer to the persistent copy of aChunk
    // in the segment.
@@ -124,9 +124,9 @@ diff --git a/content/media/AudioSegment.h b/content/media/AudioSegment.h
      chunk->mChannelData.SwapElements(aChunk->mChannelData);
      chunk->mVolume = aChunk->mVolume;
      chunk->mBufferFormat = aChunk->mBufferFormat;
-+#ifdef MOZILLA_INTERNAL_API    
++#ifdef MOZILLA_INTERNAL_API
 +    chunk->mTimeStamp = TimeStamp::Now();
-+#endif    
++#endif
      return chunk;
    }
    void ApplyVolume(float aVolume);
@@ -451,7 +451,7 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
  #include "nsTArray.h"
 +#ifdef MOZILLA_INTERNAL_API
 +#include "mozilla/TimeStamp.h"
-+#endif 
++#endif
  #include <algorithm>
 +#include "Latency.h"
  
@@ -473,7 +473,7 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
      }
 +#ifdef MOZILLA_INTERNAL_API
 +    mChunks[0].mTimeStamp = mozilla::TimeStamp::Now();
-+#endif    
++#endif
      mDuration += aDuration;
    }
    virtual void AppendNullData(TrackTicks aDuration)
@@ -491,9 +491,9 @@ diff --git a/content/media/MediaSegment.h b/content/media/MediaSegment.h
    }
  
    nsTArray<Chunk> mChunks;
-+#ifdef MOZILLA_INTERNAL_API  
++#ifdef MOZILLA_INTERNAL_API
 +  mozilla::TimeStamp mTimeStamp;
-+#endif  
++#endif
  };
  
  }
@@ -594,9 +594,9 @@ diff --git a/content/media/webrtc/MediaEngineWebRTC.h b/content/media/webrtc/Med
 -  ~MediaEngineWebRTC() { Shutdown(); }
 +  ~MediaEngineWebRTC() {
 +    Shutdown();
-+#ifdef MOZ_B2G_CAMERA   
++#ifdef MOZ_B2G_CAMERA
 +    AsyncLatencyLogger::Get()->Release();
-+#endif   
++#endif
 +  }
  
    // Clients should ensure to clean-up sources video/audio sources
